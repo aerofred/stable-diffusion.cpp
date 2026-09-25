@@ -84,10 +84,23 @@ with `--params-backend diffusion=disk`, released directly from) its own device;
 an explicit assignment such as `te=cpu` keeps the parameters on that backend
 and stages each range to its device on demand.
 
-Layer split uses the fixed graph-cut plan to assign blocks across devices, but
-single-device segmented execution and next-segment prefetch are disabled for
-the split module. `--max-vram` can still provide the per-device limits used by
-layer split and auto-fit.
+Layer split uses the fixed graph-cut plan to assign blocks across devices. When
+the module's weights and compute buffers fit resident on the listed devices, the
+whole graph runs in one scheduler pass. Otherwise the graph runs segment by
+segment, exactly like single-device segmented execution: each block's weights are
+staged to (and prefetched on) the device that owns it, the residual stream is
+copied across devices only at range boundaries, and the resident weight cache
+spans every listed device. Weights that exceed the combined device budgets are
+spread across the devices in proportion to their budgets and streamed per segment
+instead of being rejected. `--max-vram` can still provide the per-device limits
+used by layer split and auto-fit.
+
+Note that layer split pools the devices' memory for *weights*, not for
+activations: every block still executes on a single device, so a module's
+compute buffer (which grows with resolution and frame count) must fit on each
+device individually. Splitting a module across two GPUs therefore does not raise
+the maximum resolution or frame count; it lets more of a large model stay
+resident instead of being re-staged from RAM at every step.
 
 Use `--list-devices` to see the device names available on the system.
 

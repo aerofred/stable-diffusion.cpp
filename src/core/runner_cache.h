@@ -55,9 +55,15 @@ namespace sd {
             : backend_(backend) {}
         ggml_tensor* get(const std::string& name) const;
         size_t resident_bytes(ggml_backend_dev_t device) const;
+        // Cut outputs are kept on the device that produced them (the segment's
+        // backend); a null backend selects the runner's primary backend.
         size_t estimate_output_bytes(ggml_cgraph* graph,
-                                     const ggml_graph_cut::Segment& segment) const;
-        bool capture(ggml_cgraph* graph, const ggml_graph_cut::Segment& segment, const char* log_desc);
+                                     const ggml_graph_cut::Segment& segment,
+                                     ggml_backend_t backend = nullptr) const;
+        bool capture(ggml_cgraph* graph,
+                     const ggml_graph_cut::Segment& segment,
+                     const char* log_desc,
+                     ggml_backend_t backend = nullptr);
         void prune(const std::unordered_set<std::string>& keep_names);
         void clear() { tensors_.clear(); }
     };

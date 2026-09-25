@@ -654,6 +654,9 @@ namespace LTXV {
     };
 
     struct CrossAttention : public GGMLBlock {
+        static constexpr int64_t FLASH_ATTN_KV_SCALE_MIN_KEYS = 2048;
+        static constexpr float FLASH_ATTN_KV_SCALE            = 1.f / 128.f;
+
         int64_t heads;
         int64_t dim_head;
         bool rope_interleaved;
@@ -709,6 +712,16 @@ namespace LTXV {
                 k = apply_hidden_rope(ctx->ggml_ctx, k, k_pe, heads, dim_head, rope_interleaved);
             }
 
+            // The CUDA flash-attention MMA kernel accumulates the unnormalized
+            // P*V sum in F16. With thousands of keys and flat attention (audio
+            // tokens attending every video token) it overflows to inf and the
+            // whole latent becomes NaN; observed above ~10k video tokens
+            // (640x480 with 38+ latent frames). Shrinking K/V keeps the
+            // accumulator in range; ggml_ext_attention_ext compensates.
+            float kv_scale = 1.f;
+            if (ctx->flash_attn_enabled && k->ne[1] > FLASH_ATTN_KV_SCALE_MIN_KEYS) {
+                kv_scale = FLASH_ATTN_KV_SCALE;
+            }
             auto out = ggml_ext_attention_ext(ctx,
                                               q,
                                               k,
@@ -716,7 +729,8 @@ namespace LTXV {
                                               heads,
                                               mask,
                                               false,
-                                              ctx->flash_attn_enabled);
+                                              ctx->flash_attn_enabled,
+                                              kv_scale);
 
             if (blocks.count("to_gate_logits") > 0) {
                 auto to_gate_logits = std::dynamic_pointer_cast<Linear>(blocks["to_gate_logits"]);
@@ -1174,12 +1188,12 @@ namespace LTXV {
             if (count < 0) {
                 count = coeff - start;
             }
+            // With per-token timesteps (image conditioning) `timestep` is
+            // [dim * coeff, tokens]; broadcasting the table avoids two
+            // token-sized copies per call, which dominated the compute buffer.
             auto t      = ggml_reshape_3d(ctx->ggml_ctx, timestep, dim, coeff, timestep->ne[1]);
             auto s      = ggml_reshape_3d(ctx->ggml_ctx, table, dim, coeff, 1);
-            auto e      = ggml_new_tensor_3d(ctx->ggml_ctx, timestep->type, dim, coeff, timestep->ne[1]);
-            t           = ggml_repeat(ctx->ggml_ctx, t, e);
-            s           = ggml_repeat(ctx->ggml_ctx, s, e);
-            auto out    = ggml_add(ctx->ggml_ctx, s, t);
+            auto out    = ggml_add(ctx->ggml_ctx, t, s);
             auto chunks = ggml_ext_chunk(ctx->ggml_ctx, out, static_cast<int>(coeff), 1);
             return std::vector<ggml_tensor*>(chunks.begin() + start, chunks.begin() + start + count);
         }

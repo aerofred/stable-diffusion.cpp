@@ -152,9 +152,10 @@ namespace sd {
 
     size_t GraphCutTensorCache::estimate_output_bytes(
         ggml_cgraph* graph,
-        const ggml_graph_cut::Segment& segment) const {
+        const ggml_graph_cut::Segment& segment,
+        ggml_backend_t backend) const {
         ggml_backend_buffer_type_t buffer_type =
-            ggml_backend_get_default_buffer_type(backend_);
+            ggml_backend_get_default_buffer_type(backend != nullptr ? backend : backend_);
         if (buffer_type == nullptr) {
             return SIZE_MAX;
         }
@@ -182,16 +183,18 @@ namespace sd {
 
     bool GraphCutTensorCache::capture(ggml_cgraph* graph,
                                       const ggml_graph_cut::Segment& segment,
-                                      const char* log_desc) {
-        size_t copied_bytes = 0;
-        size_t copied_count = 0;
+                                      const char* log_desc,
+                                      ggml_backend_t backend) {
+        ggml_backend_t target = backend != nullptr ? backend : backend_;
+        size_t copied_bytes   = 0;
+        size_t copied_count   = 0;
         for (int index : segment.output_node_indices) {
             auto output = ggml_graph_node(graph, index);
             if (!ggml_graph_cut::is_graph_cut_tensor(output) ||
                 !segment.future_cut_names.count(output->name)) {
                 continue;
             }
-            auto entry = CachedTensor::copy(backend_, output->name, ggml_graph_cut::cache_source_tensor(output));
+            auto entry = CachedTensor::copy(target, output->name, ggml_graph_cut::cache_source_tensor(output));
             if (entry == nullptr) {
                 LOG_ERROR("%s failed to capture graph cut tensor: %s", log_desc, output->name);
                 return false;
@@ -201,7 +204,7 @@ namespace sd {
             ++copied_count;
             tensors_[output->name] = std::move(entry);
         }
-        ggml_backend_synchronize(backend_);
+        ggml_backend_synchronize(target);
         if (copied_count > 0) {
             LOG_DEBUG("%s graph cut cache added %6.2f MB (%zu tensors)",
                       log_desc, copied_bytes / (1024.f * 1024.f), copied_count);

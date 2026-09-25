@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <limits>
 #include <optional>
 
 #include "conditioning/wan_audio.h"
@@ -1242,6 +1243,35 @@ namespace sd::pipeline {
                     (int)video_latent.shape()[1],
                     (int)video_latent.shape()[2],
                     (int)video_latent.shape()[3]);
+        {
+            // A blank (all white) decode is usually a non-finite latent; report it before decoding.
+            const float* values     = video_latent.data();
+            const int64_t count     = video_latent.numel();
+            int64_t non_finite      = 0;
+            double sum              = 0.0;
+            float min_value         = std::numeric_limits<float>::max();
+            float max_value         = std::numeric_limits<float>::lowest();
+            for (int64_t i = 0; i < count; ++i) {
+                const float value = values[i];
+                if (!std::isfinite(value)) {
+                    non_finite++;
+                    continue;
+                }
+                sum += value;
+                min_value = std::min(min_value, value);
+                max_value = std::max(max_value, value);
+            }
+            const int64_t finite = count - non_finite;
+            LOG_VERBOSE("decode_video_outputs latent stats: min %.4f, max %.4f, mean %.4f, non-finite %lld / %lld",
+                        finite > 0 ? min_value : 0.f,
+                        finite > 0 ? max_value : 0.f,
+                        finite > 0 ? sum / (double)finite : 0.0,
+                        (long long)non_finite,
+                        (long long)count);
+            if (non_finite > 0) {
+                LOG_WARN("video latent contains %lld non-finite values; the decoded video will be blank", (long long)non_finite);
+            }
+        }
         // auto z = sd::load_tensor_from_file_as_tensor<float>("ltx_vae_z.bin");
         int64_t t4            = ggml_time_ms();
         sd::Tensor<float> vid = sd->decode_first_stage(video_latent, true);

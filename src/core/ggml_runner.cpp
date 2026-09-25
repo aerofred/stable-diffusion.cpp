@@ -225,8 +225,10 @@ void GGMLRunner::pin_multi_device_nodes(ggml_backend_sched_t sched, ggml_cgraph*
                 }
             }
         }
-        if (node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
-            node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
+        // In-place ops are views of their source: pinning them elsewhere would
+        // run the kernel on one device over the other device's memory.
+        if (node->view_src != nullptr || node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW ||
+            node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
             continue;
         }
         if (ggml_backend_supports_op(current, node)) {
@@ -236,14 +238,13 @@ void GGMLRunner::pin_multi_device_nodes(ggml_backend_sched_t sched, ggml_cgraph*
 }
 
 size_t GGMLRunner::retained_runtime_buffer_bytes(ggml_backend_t backend) const {
-    backend      = backend == nullptr ? runtime_backend : backend;
-    size_t bytes = workspace_.bytes(backend);
-    if (backend == runtime_backend) {
-        const size_t cache_bytes = cache_.resident_bytes(ggml_backend_get_device(backend));
-        bytes                    = cache_bytes > SIZE_MAX - bytes ? SIZE_MAX : bytes + cache_bytes;
-        const size_t cut_bytes   = cut_cache_.resident_bytes(ggml_backend_get_device(backend));
-        bytes                    = cut_bytes > SIZE_MAX - bytes ? SIZE_MAX : bytes + cut_bytes;
-    }
+    backend                   = backend == nullptr ? runtime_backend : backend;
+    size_t bytes              = workspace_.bytes(backend);
+    ggml_backend_dev_t device = ggml_backend_get_device(backend);
+    const size_t cache_bytes  = cache_.resident_bytes(device);
+    bytes                     = cache_bytes > SIZE_MAX - bytes ? SIZE_MAX : bytes + cache_bytes;
+    const size_t cut_bytes    = cut_cache_.resident_bytes(device);
+    bytes                     = cut_bytes > SIZE_MAX - bytes ? SIZE_MAX : bytes + cut_bytes;
     return bytes;
 }
 
@@ -711,12 +712,13 @@ ComputeWorkspace::Measurement GGMLRunner::measure(ggml_cgraph* graph, size_t dir
 
 std::vector<DeviceMemoryRequest> GGMLRunner::memory_requests(
     const std::vector<BackendBufferSize>& sizes,
-    size_t pending_cache_bytes) const {
+    const std::map<ggml_backend_t, size_t>& pending_cache_bytes) const {
     std::vector<DeviceMemoryRequest> requests;
     for (const auto& size : sizes) {
         const size_t retained    = retained_runtime_buffer_bytes(size.backend);
         const size_t reusable    = workspace_.bytes(size.backend);
-        const size_t cache_bytes = size.backend == runtime_backend ? pending_cache_bytes : 0;
+        const auto cache_entry   = pending_cache_bytes.find(size.backend);
+        const size_t cache_bytes = cache_entry == pending_cache_bytes.end() ? 0 : cache_entry->second;
         const size_t pending     = add_bytes(size.bytes > reusable ? size.bytes - reusable : 0, cache_bytes);
         size_t limit             = max_graph_vram_bytes;
         if (is_multi_device()) {
@@ -733,6 +735,35 @@ std::vector<DeviceMemoryRequest> GGMLRunner::memory_requests(
                             retained, limit});
     }
     return requests;
+}
+
+std::vector<ggml_backend_t> GGMLRunner::segment_backends(const GraphCutPlan& plan, ggml_cgraph* gf) const {
+    std::vector<ggml_backend_t> backends(plan.segments.size(), runtime_backend);
+    if (!is_multi_device() || graph_cut_layer_split_node_assignments_.empty() || gf == nullptr) {
+        return backends;
+    }
+    const int n_nodes = ggml_graph_n_nodes(gf);
+    auto find_assignment = [&](const std::vector<int>& node_indices, ggml_backend_t* backend) {
+        for (int node_index : node_indices) {
+            if (node_index < 0 || node_index >= n_nodes) {
+                continue;
+            }
+            auto assignment = graph_cut_layer_split_node_assignments_.find(ggml_graph_node(gf, node_index));
+            if (assignment != graph_cut_layer_split_node_assignments_.end() && assignment->second != nullptr) {
+                *backend = assignment->second;
+                return true;
+            }
+        }
+        return false;
+    };
+    for (size_t index = 0; index < plan.segments.size(); ++index) {
+        // Cut outputs belong to exactly one segment; internal nodes can be
+        // shared prelude work that stays unassigned.
+        if (!find_assignment(plan.segments[index].output_node_indices, &backends[index])) {
+            find_assignment(plan.segments[index].internal_node_indices, &backends[index]);
+        }
+    }
+    return backends;
 }
 
 bool GGMLRunner::fits(const std::vector<DeviceMemoryRequest>& requests,
@@ -827,11 +858,14 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
         last_compute_status_ = GGML_STATUS_ALLOC_FAILED;
         return std::nullopt;
     }
-    auto manager         = residency_manager.lock();
-    const bool segmented = !is_multi_device() && !sd_backend_is_cpu(runtime_backend) &&
+    auto manager = residency_manager.lock();
+    // Multi-device graphs segment too: each segment runs on the device holding
+    // its weights and the scheduler copies the residual stream at range
+    // boundaries, so a split module can stream weights that do not fit resident.
+    const bool segmented = !sd_backend_is_cpu(runtime_backend) &&
                            manager != nullptr && manager->segmented_compute_enabled() &&
                            cached_plan.valid && cached_plan.has_cuts && cached_plan.segments.size() > 1 &&
-                           !fits(memory_requests(full_measurement.buffers, cache_.pending_bytes(graph)), params);
+                           !fits(memory_requests(full_measurement.buffers, {{runtime_backend, cache_.pending_bytes(graph)}}), params);
     ggml_graph_cut::Plan monolithic_plan;
     if (!segmented) {
         monolithic_plan.segments.emplace_back();
@@ -859,10 +893,25 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
         LOG_VERBOSE("%s using %zu segment%s", get_desc().c_str(),
                     plan.segments.size(), plan.segments.size() == 1 ? "" : "s");
     }
+    const std::vector<ggml_backend_t> plan_segment_backends = segment_backends(plan, graph);
+    if (segmented && segments_changed && is_multi_device()) {
+        std::map<ggml_backend_t, size_t> segments_per_backend;
+        for (ggml_backend_t backend : plan_segment_backends) {
+            segments_per_backend[backend]++;
+        }
+        std::string placement;
+        for (const auto& entry : segments_per_backend) {
+            placement += sd_format("%s%s: %zu", placement.empty() ? "" : ", ",
+                                   ggml_backend_name(entry.first), entry.second);
+        }
+        LOG_INFO("%s streaming %zu segments across %zu devices (%s)", get_desc().c_str(),
+                 plan.segments.size(), segments_per_backend.size(), placement.c_str());
+    }
     SegmentGraphBindings bindings(cut_cache_, plan, graph);
     SegmentWeightPipeline weights(manager, runtime_backend, reinterpret_cast<uintptr_t>(this),
                                   graph, plan, params_tensor_set_,
-                                  segmented && manager != nullptr && manager->prefetch_enabled());
+                                  segmented && manager != nullptr && manager->prefetch_enabled(),
+                                  plan_segment_backends);
 
     std::map<ggml_backend_t, size_t> peak_compute_bytes;
     auto track_compute_buffer = [&](ggml_backend_t backend) {
@@ -910,9 +959,12 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
             last_compute_status_ = GGML_STATUS_ALLOC_FAILED;
             return fail_segment("workspace preparation");
         }
-        const size_t cut_bytes       = last ? 0 : cut_cache_.estimate_output_bytes(graph, segment);
-        const size_t new_cache_bytes = add_bytes(cut_bytes, cache_.pending_bytes(segment_graph));
-        auto ensure_capacity         = [&]() {
+        ggml_backend_t segment_backend = plan_segment_backends[index];
+        const size_t cut_bytes         = last ? 0 : cut_cache_.estimate_output_bytes(graph, segment, segment_backend);
+        std::map<ggml_backend_t, size_t> new_cache_bytes;
+        new_cache_bytes[runtime_backend] = cache_.pending_bytes(segment_graph);
+        new_cache_bytes[segment_backend] = add_bytes(new_cache_bytes[segment_backend], cut_bytes);
+        auto ensure_capacity             = [&]() {
             sync_runtime_residency();
             auto requests = memory_requests(measurement.buffers, new_cache_bytes);
             if (fits(requests, weights.params(index))) {
@@ -958,15 +1010,13 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
             return fail_segment("allocated capacity check");
         }
         copy_data_to_backend_tensor(segment_graph, false);
-        auto prefetch_requests = memory_requests(measurement.buffers, new_cache_bytes);
-        if (!prefetch_requests.empty()) {
-            weights.enqueue_next(index, prefetch_requests.front());
-        }
-        LOG_DEBUG("%s executing segment %zu/%zu: %s", get_desc().c_str(),
-                  index + 1, plan.segments.size(), segment.group_name.c_str());
+        weights.enqueue_next(index, memory_requests(measurement.buffers, new_cache_bytes));
+        LOG_DEBUG("%s executing segment %zu/%zu: %s on %s", get_desc().c_str(),
+                  index + 1, plan.segments.size(), segment.group_name.c_str(),
+                  ggml_backend_name(segment_backend));
         if (!execute_segment(segment_graph, n_threads) ||
             !cache_.capture(segment_graph) ||
-            !cut_cache_.capture(graph, segment, get_desc().c_str())) {
+            !cut_cache_.capture(graph, segment, get_desc().c_str(), segment_backend)) {
             return fail_segment("execution or output caching");
         }
         sync_runtime_residency();

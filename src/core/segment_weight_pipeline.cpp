@@ -24,10 +24,12 @@ namespace sd {
         ggml_cgraph* graph,
         const ggml_graph_cut::Plan& plan,
         const std::unordered_set<const ggml_tensor*>& params,
-        bool enabled)
+        bool enabled,
+        const std::vector<ggml_backend_t>& segment_backends)
         : residency_manager_(residency_manager),
           compute_backend_(compute_backend),
           owner_id_(owner_id),
+          segment_backends_(segment_backends),
           enabled_(enabled && residency_manager != nullptr) {
         segment_params_.resize(plan.segments.size());
         for (size_t segment_index = 0; segment_index < plan.segments.size(); ++segment_index) {
@@ -54,6 +56,13 @@ namespace sd {
             }
         }
         return SIZE_MAX;
+    }
+
+    ggml_backend_t SegmentWeightPipeline::segment_backend(size_t segment_index) const {
+        if (segment_index < segment_backends_.size() && segment_backends_[segment_index] != nullptr) {
+            return segment_backends_[segment_index];
+        }
+        return compute_backend_;
     }
 
     std::vector<std::vector<ggml_tensor*>> SegmentWeightPipeline::preferred_eviction_order() const {
@@ -127,8 +136,8 @@ namespace sd {
 
     void SegmentWeightPipeline::enqueue_next(
         size_t segment_index,
-        const DeviceMemoryRequest& request) {
-        if (!enabled_ || queued_segment_ != SIZE_MAX) {
+        const std::vector<DeviceMemoryRequest>& requests) {
+        if (!enabled_ || queued_segment_ != SIZE_MAX || requests.empty()) {
             return;
         }
 
@@ -166,8 +175,16 @@ namespace sd {
             return;
         }
 
-        DeviceMemoryRequest backend_request        = request;
-        backend_request.compute_backend            = compute_backend_;
+        ggml_backend_t next_backend        = segment_backend(next_segment);
+        const DeviceMemoryRequest* request = &requests.front();
+        for (const auto& candidate : requests) {
+            if (candidate.compute_backend == next_backend) {
+                request = &candidate;
+                break;
+            }
+        }
+        DeviceMemoryRequest backend_request        = *request;
+        backend_request.compute_backend            = next_backend;
         backend_request.owner_id                   = owner_id_;
         std::vector<ggml_tensor*> protected_params = segment_params_[segment_index];
         protected_params.insert(protected_params.end(), params.begin(), params.end());

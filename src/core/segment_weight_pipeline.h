@@ -26,12 +26,14 @@ namespace sd {
         ggml_backend_t compute_backend_ = nullptr;
         uintptr_t owner_id_             = 0;
         std::vector<std::vector<ggml_tensor*>> segment_params_;
+        std::vector<ggml_backend_t> segment_backends_;
         std::vector<ggml_tensor*> queued_params_;
         std::vector<ggml_tensor*> pinned_params_;
         size_t queued_segment_ = SIZE_MAX;
         bool enabled_          = true;
 
         size_t next_parameter_segment(size_t segment_index) const;
+        ggml_backend_t segment_backend(size_t segment_index) const;
         std::vector<std::vector<ggml_tensor*>> preferred_eviction_order() const;
         void disable();
         void activate(size_t segment_index);
@@ -45,7 +47,8 @@ namespace sd {
             ggml_cgraph* graph,
             const ggml_graph_cut::Plan& plan,
             const std::unordered_set<const ggml_tensor*>& params,
-            bool enabled = true);
+            bool enabled                                         = true,
+            const std::vector<ggml_backend_t>& segment_backends = {});
         ~SegmentWeightPipeline();
 
         const std::vector<ggml_tensor*>& params(size_t index) const { return segment_params_[index]; }
@@ -54,8 +57,10 @@ namespace sd {
         bool segment_start(size_t segment_index, const std::function<bool()>& ensure_capacity);
         void segment_end();
         // Prefetch is best effort; segment_start falls back to synchronous loading.
+        // The request matching the next segment's device is used; with a single
+        // device that is the runner's own request.
         void enqueue_next(size_t segment_index,
-                          const DeviceMemoryRequest& request);
+                          const std::vector<DeviceMemoryRequest>& requests);
     };
 }
 

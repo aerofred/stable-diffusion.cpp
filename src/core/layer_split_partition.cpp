@@ -151,25 +151,55 @@ namespace sd {
             return param_assignments.count(param) != 0;
         });
 
+        // Segmented execution streams weights that exceed a device's budget, so
+        // an oversized module is spread in proportion to each device's budget
+        // instead of being rejected; the overflow is then staged per segment.
+        std::vector<int64_t> fill_targets = backend_capacities;
+        if (!reuse_assignments) {
+            const int64_t unknown_capacity = std::numeric_limits<int64_t>::max() / 4;
+            int64_t total_capacity         = 0;
+            bool capacities_known          = true;
+            for (int64_t capacity : backend_capacities) {
+                if (capacity >= unknown_capacity) {
+                    capacities_known = false;
+                    break;
+                }
+                total_capacity += capacity;
+            }
+            if (capacities_known && total_capacity > 0 && total_param_bytes > total_capacity) {
+                for (size_t i = 0; i < fill_targets.size(); i++) {
+                    fill_targets[i] = (int64_t)((long double)backend_capacities[i] * (long double)total_param_bytes /
+                                                (long double)total_capacity);
+                }
+                LOG_INFO("%s graph-cut layer split: %.1f MB of weights exceed the combined %.1f MB device budget; "
+                         "distributing them proportionally and streaming the remainder per segment",
+                         desc,
+                         total_param_bytes / (1024.0 * 1024.0),
+                         total_capacity / (1024.0 * 1024.0));
+            }
+        }
+
         std::vector<ggml_backend_t> backend_by_segment(plan.segments.size(), split_backends[0]);
         size_t current_backend = 0;
         int64_t current_used   = 0;
+        bool overflow_logged   = false;
         for (size_t seg_idx = 0; seg_idx < plan.segments.size(); seg_idx++) {
             int64_t bytes = segment_param_bytes[seg_idx];
             while (!reuse_assignments && current_backend + 1 < split_backends.size() &&
                    bytes > 0 &&
-                   current_used + bytes > backend_capacities[current_backend]) {
+                   current_used + bytes > fill_targets[current_backend]) {
                 current_backend++;
                 current_used = 0;
             }
-            if (!reuse_assignments && bytes > 0 && current_used + bytes > backend_capacities[current_backend]) {
-                LOG_ERROR("%s graph-cut layer split: segment %zu needs %.1f MB on %s, but only %.1f MB is available under current VRAM limits",
-                          desc,
-                          seg_idx,
-                          (current_used + bytes) / (1024.0 * 1024.0),
-                          layer_split_backend_device_display_name(split_backends[current_backend]).c_str(),
-                          backend_capacities[current_backend] / (1024.0 * 1024.0));
-                return false;
+            if (!reuse_assignments && !overflow_logged && bytes > 0 &&
+                current_used + bytes > backend_capacities[current_backend]) {
+                LOG_VERBOSE("%s graph-cut layer split: from segment %zu, %s holds more weights (%.1f MB) than its %.1f MB budget; the excess is streamed",
+                            desc,
+                            seg_idx,
+                            layer_split_backend_device_display_name(split_backends[current_backend]).c_str(),
+                            (current_used + bytes) / (1024.0 * 1024.0),
+                            backend_capacities[current_backend] / (1024.0 * 1024.0));
+                overflow_logged = true;
             }
             current_used += bytes;
 
@@ -202,12 +232,24 @@ namespace sd {
             backend_by_segment[seg_idx] = split_backends[current_backend];
         }
 
+        // Nodes reachable from several segments (timestep embeddings, modulation
+        // tables) are recomputed by each of them; leave them unpinned so the
+        // scheduler places each copy next to its consumer instead of on the last
+        // segment's device.
         const int n_nodes = ggml_graph_n_nodes(gf);
+        std::vector<int> segment_uses(static_cast<size_t>(std::max(n_nodes, 0)), 0);
+        for (const auto& segment : plan.segments) {
+            for (int node_index : segment.internal_node_indices) {
+                if (node_index >= 0 && node_index < n_nodes) {
+                    segment_uses[node_index]++;
+                }
+            }
+        }
         for (size_t seg_idx = 0; seg_idx < plan.segments.size(); seg_idx++) {
             ggml_backend_t backend = backend_by_segment[seg_idx];
             const auto& segment    = plan.segments[seg_idx];
             for (int node_index : segment.internal_node_indices) {
-                if (node_index < 0 || node_index >= n_nodes) {
+                if (node_index < 0 || node_index >= n_nodes || segment_uses[node_index] > 1) {
                     continue;
                 }
                 ggml_tensor* node = ggml_graph_node(gf, node_index);

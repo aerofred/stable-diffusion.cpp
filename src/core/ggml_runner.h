@@ -135,7 +135,7 @@ private:
 
     sd::ComputeWorkspace::Measurement measure(ggml_cgraph* graph, size_t direct_bytes);
     std::vector<DeviceMemoryRequest> memory_requests(const std::vector<sd::BackendBufferSize>& sizes,
-                                                     size_t pending_cache_bytes) const;
+                                                     const std::map<ggml_backend_t, size_t>& pending_cache_bytes) const;
     bool fits(const std::vector<DeviceMemoryRequest>& requests,
               const std::vector<ggml_tensor*>& params) const;
     bool execute_segment(ggml_cgraph* graph, int n_threads);
@@ -273,6 +273,10 @@ protected:
     const GraphCutPlan& resolve_graph_cut_layer_split_plan(ggml_cgraph* gf);
 
     bool assign_graph_cut_layer_split_backends(ggml_cgraph* gf);
+
+    // Device that runs each segment of a plan: the layer split assignment of its
+    // nodes, or the primary backend for single-device execution.
+    std::vector<ggml_backend_t> segment_backends(const GraphCutPlan& plan, ggml_cgraph* gf) const;
 
 public:
     bool runner_start();
