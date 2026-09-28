@@ -9,6 +9,7 @@
 
 #include "core/ggml_extend_backend.h"
 #include "core/util.h"
+#include "ggml-alloc.h"
 #include "model/adapter/lora.hpp"
 
 static size_t aligned_offset(const void* buffer, size_t offset, size_t alignment) {
@@ -543,7 +544,9 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
         const int64_t t0     = ggml_time_ms();
         size_t staged_bytes  = 0;
         size_t staged_blocks = 0;
-        auto stage_chunk     = [&](const std::vector<TensorState*>& chunk) -> bool {
+        const bool pooled    = !ggml_backend_buft_is_host(staging_buft) &&
+                            staging_buft == ggml_backend_get_default_buffer_type(compute_backend);
+        auto stage_chunk = [&](const std::vector<TensorState*>& chunk, size_t chunk_bytes) -> bool {
             if (chunk.empty()) {
                 return true;
             }
@@ -562,11 +565,22 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
                 staged_tensors.push_back({state, staging_tensor});
             }
 
-            ggml_backend_buffer_t compute_buffer =
-                ggml_backend_alloc_ctx_tensors_from_buft(staging_ctx, staging_buft);
+            ggml_backend_buffer_t compute_buffer = nullptr;
+            bool block_pooled                    = pooled;
+            if (pooled) {
+                compute_buffer = acquire_staging_buffer(staging_buft, chunk_bytes + alignment);
+                if (compute_buffer != nullptr && !bind_staging_tensors(compute_buffer, staged_tensors)) {
+                    ggml_backend_buffer_free(compute_buffer);
+                    compute_buffer = nullptr;
+                }
+            }
+            if (compute_buffer == nullptr) {
+                block_pooled   = false;
+                compute_buffer = ggml_backend_alloc_ctx_tensors_from_buft(staging_ctx, staging_buft);
+            }
             if (compute_buffer == nullptr) {
                 LOG_ERROR("model manager alloc compute params backend buffer failed, num_tensors = %zu",
-                              staged_tensors.size());
+                          staged_tensors.size());
                 ggml_free(staging_ctx);
                 return false;
             }
@@ -575,18 +589,27 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
                 TensorState* state          = staged_tensor.first;
                 ggml_tensor* managed_tensor = state->tensor;
                 ggml_tensor* staging_tensor = staged_tensor.second;
-                ggml_backend_tensor_copy(managed_tensor, staging_tensor);
+                // Host uploads are queued on the compute stream; later graph
+                // work on that stream is ordered after them, so no host wait.
+                if (block_pooled && ggml_backend_buffer_is_host(managed_tensor->buffer) &&
+                    ggml_is_contiguous(managed_tensor) && ggml_is_contiguous(staging_tensor) &&
+                    ggml_nbytes(managed_tensor) == ggml_nbytes(staging_tensor)) {
+                    ggml_backend_tensor_set_async(compute_backend, staging_tensor, managed_tensor->data,
+                                                  0, ggml_nbytes(managed_tensor));
+                } else {
+                    ggml_backend_tensor_copy(managed_tensor, staging_tensor);
+                }
                 std::swap(managed_tensor->buffer, staging_tensor->buffer);
                 std::swap(managed_tensor->data, staging_tensor->data);
                 std::swap(managed_tensor->extra, staging_tensor->extra);
                 state->staged_to_compute_backend = true;
             }
-            ggml_backend_synchronize(compute_backend);
 
             auto block             = std::make_unique<ComputeStagingBlock>();
             block->compute_backend = compute_backend;
             block->buffer          = compute_buffer;
             block->staging_ctx     = staging_ctx;
+            block->pooled          = block_pooled;
             block->staged_tensors  = std::move(staged_tensors);
             staged_bytes += ggml_backend_buffer_get_size(compute_buffer);
             ++staged_blocks;
@@ -601,7 +624,7 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
                 ggml_backend_buft_get_alloc_size(staging_buft, state->tensor), alignment);
             if (!chunk.empty() && backend_limit > 0 &&
                 tensor_size > backend_limit - std::min(chunk_size, backend_limit)) {
-                if (!stage_chunk(chunk)) {
+                if (!stage_chunk(chunk, chunk_size)) {
                     return false;
                 }
                 chunk.clear();
@@ -610,7 +633,7 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
             chunk.push_back(state);
             chunk_size = tensor_size > SIZE_MAX - chunk_size ? SIZE_MAX : chunk_size + tensor_size;
         }
-        if (!stage_chunk(chunk)) {
+        if (!stage_chunk(chunk, chunk_size)) {
             return false;
         }
         LOG_VERBOSE("model manager staged compute params (%6.2f MB, %zu tensors, %zu blocks) to %s, taking %.2fs",
@@ -690,8 +713,8 @@ bool ModelManager::apply_loras_to_params(const std::vector<TensorState*>& states
             // The temporary runner is destroyed before this manager call returns.
             auto borrowed_manager = std::shared_ptr<ModelManager>(this, [](ModelManager*) {});
             auto lora             = std::make_shared<LoraModel>(id, compute_backend, target->params_backend,
-                                                    borrowed_manager, lora_spec.file_id, lora_version_,
-                                                    target->residency_mode);
+                                                                borrowed_manager, lora_spec.file_id, lora_version_,
+                                                                target->residency_mode);
 
             LoraModel::filter_t lora_tensor_filter = nullptr;
             if (!lora_spec.tensor_name_prefix_filter.empty()) {
@@ -1037,7 +1060,7 @@ void ModelManager::free_compute_staging_block(ComputeStagingBlock& block) {
     }
 
     if (block.buffer != nullptr) {
-        ggml_backend_buffer_free(block.buffer);
+        release_staging_buffer(block.buffer, block.pooled);
         block.buffer = nullptr;
     }
     if (block.staging_ctx != nullptr) {
@@ -1045,6 +1068,107 @@ void ModelManager::free_compute_staging_block(ComputeStagingBlock& block) {
         block.staging_ctx = nullptr;
     }
     block.staged_tensors.clear();
+}
+
+ggml_backend_buffer_t ModelManager::acquire_staging_buffer(ggml_backend_buffer_type_t buffer_type, size_t size) {
+    auto pool_entry = staging_buffer_pool_.find(buffer_type);
+    if (pool_entry != staging_buffer_pool_.end()) {
+        auto& pool         = pool_entry->second;
+        size_t best        = pool.size();
+        const size_t slack = std::max<size_t>(size / 8, 64ULL * 1024ULL * 1024ULL);
+        for (size_t i = 0; i < pool.size(); ++i) {
+            if (pool[i].size >= size && pool[i].size - size <= slack &&
+                (best == pool.size() || pool[i].size < pool[best].size)) {
+                best = i;
+            }
+        }
+        if (best < pool.size()) {
+            ggml_backend_buffer_t buffer = pool[best].buffer;
+            pool.erase(pool.begin() + static_cast<std::ptrdiff_t>(best));
+            return buffer;
+        }
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buffer_type, size);
+    if (buffer == nullptr) {
+        ggml_backend_dev_t device = ggml_backend_buft_get_device(buffer_type);
+        if (pooled_staging_bytes(device) > 0) {
+            trim_staging_buffer_pool(device);
+            buffer = ggml_backend_buft_alloc_buffer(buffer_type, size);
+        }
+    }
+    return buffer;
+}
+
+void ModelManager::release_staging_buffer(ggml_backend_buffer_t buffer, bool pooled) {
+    if (buffer == nullptr) {
+        return;
+    }
+    if (!pooled) {
+        ggml_backend_buffer_free(buffer);
+        return;
+    }
+    auto& pool = staging_buffer_pool_[ggml_backend_buffer_get_type(buffer)];
+    pool.push_back({buffer, ggml_backend_buffer_get_size(buffer)});
+    while (pool.size() > MAX_POOLED_STAGING_BUFFERS) {
+        ggml_backend_buffer_free(pool.front().buffer);
+        pool.erase(pool.begin());
+    }
+}
+
+void ModelManager::trim_staging_buffer_pool(ggml_backend_dev_t device) {
+    size_t freed = 0;
+    for (auto& entry : staging_buffer_pool_) {
+        if (device != nullptr && ggml_backend_buft_get_device(entry.first) != device) {
+            continue;
+        }
+        for (auto& pooled : entry.second) {
+            freed += pooled.size;
+            ggml_backend_buffer_free(pooled.buffer);
+        }
+        entry.second.clear();
+    }
+    if (freed > 0) {
+        LOG_DEBUG("model manager freed %6.2f MB of pooled staging buffers on %s",
+                  freed / (1024.f * 1024.f),
+                  device != nullptr ? ggml_backend_dev_name(device) : "all devices");
+    }
+}
+
+size_t ModelManager::pooled_staging_bytes(ggml_backend_dev_t device) const {
+    size_t bytes = 0;
+    for (const auto& entry : staging_buffer_pool_) {
+        if (device != nullptr && ggml_backend_buft_get_device(entry.first) != device) {
+            continue;
+        }
+        for (const auto& pooled : entry.second) {
+            bytes = pooled.size > SIZE_MAX - bytes ? SIZE_MAX : bytes + pooled.size;
+        }
+    }
+    return bytes;
+}
+
+bool ModelManager::bind_staging_tensors(ggml_backend_buffer_t buffer,
+                                        const std::vector<std::pair<TensorState*, ggml_tensor*>>& tensors) const {
+    ggml_tallocr allocator = ggml_tallocr_new(buffer);
+    const size_t capacity  = ggml_backend_buffer_get_size(buffer);
+    for (const auto& pair : tensors) {
+        const size_t size = GGML_PAD(ggml_backend_buffer_get_alloc_size(buffer, pair.second), allocator.alignment);
+        // ggml_tallocr_alloc aborts on overflow, so check the space first.
+        if (size > capacity - std::min(allocator.offset, capacity)) {
+            return false;
+        }
+        if (ggml_tallocr_alloc(&allocator, pair.second) != GGML_STATUS_SUCCESS) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void ModelManager::trim_reclaimable_memory(ggml_backend_t compute_backend) {
+    if (compute_backend == nullptr) {
+        return;
+    }
+    trim_staging_buffer_pool(ggml_backend_get_device(compute_backend));
 }
 
 void ModelManager::release_compute_staging_blocks(bool force,
@@ -1187,6 +1311,7 @@ void ModelManager::release_all() {
     }
     release_compute_staging_blocks(true);
     release_params_storage_blocks(true);
+    trim_staging_buffer_pool(nullptr);
 }
 
 ggml_tensor* ModelManager::resolve_param_tensor(ggml_tensor* tensor) const {
@@ -1267,7 +1392,7 @@ bool ModelManager::assign_compute_backend(const std::vector<ggml_tensor*>& tenso
         return false;
     }
 
-    clear_all_prefetched_params();
+    std::vector<TensorState*> changing;
     for (TensorState* state : required_states) {
         if (state == nullptr || state->tensor == nullptr) {
             continue;
@@ -1291,7 +1416,17 @@ bool ModelManager::assign_compute_backend(const std::vector<ggml_tensor*>& tenso
                       state->name.c_str());
             return false;
         }
+        changing.push_back(state);
+    }
+    if (changing.empty()) {
+        return true;
+    }
 
+    // Queued prefetches target the previous placement.
+    clear_all_prefetched_params();
+    for (TensorState* state : changing) {
+        const bool params_follow_compute = state->params_follow_compute_backend ||
+                                           state->residency_mode == ResidencyMode::Disk;
         state->compute_backend = compute_backend;
         if (params_follow_compute) {
             state->params_backend = compute_backend;
@@ -1632,7 +1767,11 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
         }
         size_t free_bytes = 0, total_bytes = 0;
         ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
-        const size_t weights_resident = compute_backend_resident_bytes(backend);
+        // Pooled staging buffers are reused for missing weights; the remainder
+        // is freed on demand but occupies the device until then.
+        const size_t pooled           = pooled_staging_bytes(device);
+        const size_t pool_credit      = std::min(pooled, missing);
+        const size_t weights_resident = add(compute_backend_resident_bytes(backend), pooled - pool_credit);
         const size_t other_runtime    = other_runtime_resident_bytes(request.owner_id, backend);
         const size_t resident         = add(weights_resident, add(other_runtime, request.runtime_resident_bytes));
         if (log_details) {
@@ -1650,14 +1789,16 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
             return size_t{0};
         }
         if (total_bytes > 0) {
-            free_bytes = std::min(free_bytes, resident < total_bytes ? total_bytes - resident : 0);
+            free_bytes = std::min(add(free_bytes, pool_credit), resident < total_bytes ? total_bytes - resident : 0);
         }
         return free_bytes;
     };
     result.available_device_bytes = available_device_bytes(request.compute_backend);
     if (request.max_backend_bytes > 0) {
-        const size_t resident         = add(compute_backend_resident_bytes(request.compute_backend),
-                                            other_runtime_resident_bytes(request.owner_id, request.compute_backend));
+        const size_t pooled           = pooled_staging_bytes(ggml_backend_get_device(request.compute_backend));
+        const size_t resident         = add(add(compute_backend_resident_bytes(request.compute_backend),
+                                                other_runtime_resident_bytes(request.owner_id, request.compute_backend)),
+                                            pooled - std::min(pooled, missing));
         result.available_budget_bytes = resident < request.max_backend_bytes
                                             ? request.max_backend_bytes - resident
                                             : 0;
@@ -1719,6 +1860,13 @@ bool ModelManager::ensure_compute_backend_capacity(
     auto fits = [&]() { return check_capacity(request, required_states).fits(); };
     if (fits()) {
         return true;
+    }
+    ggml_backend_dev_t compute_device = ggml_backend_get_device(compute_backend);
+    if (pooled_staging_bytes(compute_device) > 0) {
+        trim_staging_buffer_pool(compute_device);
+        if (fits()) {
+            return true;
+        }
     }
     for (const auto& entry : workspace_reclaimers_) {
         if (entry.first != request.owner_id) {
@@ -1790,6 +1938,27 @@ bool ModelManager::ensure_compute_backend_capacity(
     for (TensorState* state : global_candidates) {
         add_evictable_state(state);
         if (release_eviction_states()) {
+            return true;
+        }
+    }
+
+    // Other runners' queued prefetches can be reloaded later; cancel them
+    // before giving up.
+    bool cancelled_prefetch = false;
+    for (auto it = prefetch_blocks_.begin(); it != prefetch_blocks_.end();) {
+        PrefetchBlock* block = it->second.get();
+        if (it->first != request.owner_id && block != nullptr && block->compute_backend != nullptr &&
+            ggml_backend_get_device(block->compute_backend) == compute_device) {
+            free_prefetch_block(*block);
+            it                 = prefetch_blocks_.erase(it);
+            cancelled_prefetch = true;
+        } else {
+            ++it;
+        }
+    }
+    if (cancelled_prefetch) {
+        trim_staging_buffer_pool(compute_device);
+        if (fits()) {
             return true;
         }
     }

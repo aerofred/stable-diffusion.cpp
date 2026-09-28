@@ -61,6 +61,7 @@ void GGMLRunner::alloc_compute_ctx() {
 
 void GGMLRunner::free_compute_ctx() {
     debug_tensors.clear();
+    free_graph_inputs();
     if (compute_ctx != nullptr) {
         ggml_free(compute_ctx);
         compute_ctx = nullptr;
@@ -245,6 +246,10 @@ size_t GGMLRunner::retained_runtime_buffer_bytes(ggml_backend_t backend) const {
     bytes                     = cache_bytes > SIZE_MAX - bytes ? SIZE_MAX : bytes + cache_bytes;
     const size_t cut_bytes    = cut_cache_.resident_bytes(device);
     bytes                     = cut_bytes > SIZE_MAX - bytes ? SIZE_MAX : bytes + cut_bytes;
+    if (backend == runtime_backend && input_buffer_ != nullptr) {
+        const size_t input_bytes = ggml_backend_buffer_get_size(input_buffer_);
+        bytes                    = input_bytes > SIZE_MAX - bytes ? SIZE_MAX : bytes + input_bytes;
+    }
     return bytes;
 }
 
@@ -308,7 +313,8 @@ void GGMLRunner::copy_data_to_backend_tensor(ggml_cgraph* gf, bool clear_after_c
             continue;
         }
         const char* name = ggml_get_name(tensor);
-        if (graph_tensor_set.find(tensor) == graph_tensor_set.end()) {
+        if (graph_tensor_set.find(tensor) == graph_tensor_set.end() ||
+            uploaded_inputs_.find(tensor) != uploaded_inputs_.end()) {
             continue;
         }
         if (tensor->buffer == nullptr) {
@@ -356,7 +362,9 @@ const GGMLRunner::GraphCutPlan& GGMLRunner::resolve_graph_cut_layer_split_plan(g
     return resolve_graph_cut_plan(gf);
 }
 
-bool GGMLRunner::assign_graph_cut_layer_split_backends(ggml_cgraph* gf) {
+bool GGMLRunner::assign_graph_cut_layer_split_backends(ggml_cgraph* gf,
+                                                       const GraphCutPlan& plan,
+                                                       const std::vector<ggml_tensor*>& params) {
     graph_cut_layer_split_node_assignments_.clear();
     if (!graph_cut_layer_split_enabled) {
         return true;
@@ -366,27 +374,50 @@ bool GGMLRunner::assign_graph_cut_layer_split_backends(ggml_cgraph* gf) {
         return false;
     }
 
-    const auto& plan = resolve_graph_cut_layer_split_plan(gf);
-    if (!plan.valid || !plan.has_cuts || plan.segments.size() <= 1) {
-        auto manager = residency_manager.lock();
-        if (manager == nullptr) {
-            LOG_ERROR("%s weight manager is not set for graph-cut layer split", get_desc().c_str());
-            return false;
+    const int n_nodes          = ggml_graph_n_nodes(gf);
+    const bool params_assigned = std::all_of(params.begin(), params.end(), [&](ggml_tensor* param) {
+        return param == nullptr || graph_cut_layer_split_assignments_.count(param) != 0;
+    });
+    if (params_assigned && !plan.layout.empty() && plan.layout == layer_split_layout_ &&
+        layer_split_node_backends_.size() == static_cast<size_t>(n_nodes)) {
+        for (int i = 0; i < n_nodes; ++i) {
+            if (layer_split_node_backends_[i] != nullptr) {
+                graph_cut_layer_split_node_assignments_[ggml_graph_node(gf, i)] = layer_split_node_backends_[i];
+            }
         }
-        std::vector<ggml_tensor*> graph_params = collect_used_param_tensors(gf);
-        if (!graph_params.empty() &&
-            !manager->assign_compute_backend(graph_params, runtime_backend)) {
+        return true;
+    }
+    invalidate_layer_split_cache();
+    auto cache_assignments = [&]() {
+        layer_split_layout_ = plan.layout;
+        layer_split_node_backends_.assign(static_cast<size_t>(std::max(n_nodes, 0)), nullptr);
+        for (int i = 0; i < n_nodes; ++i) {
+            auto entry = graph_cut_layer_split_node_assignments_.find(ggml_graph_node(gf, i));
+            if (entry != graph_cut_layer_split_node_assignments_.end()) {
+                layer_split_node_backends_[static_cast<size_t>(i)] = entry->second;
+            }
+        }
+    };
+
+    auto manager = residency_manager.lock();
+    if (manager == nullptr) {
+        LOG_ERROR("%s weight manager is not set for graph-cut layer split", get_desc().c_str());
+        return false;
+    }
+
+    if (!plan.valid || !plan.has_cuts || plan.segments.size() <= 1) {
+        if (!params.empty() &&
+            !manager->assign_compute_backend(params, runtime_backend)) {
             LOG_ERROR("%s graph-cut layer split failed to assign unmarked graph params to %s",
                       get_desc().c_str(),
                       sd::layer_split_backend_device_display_name(runtime_backend).c_str());
             return false;
         }
-        for (ggml_tensor* param : graph_params) {
+        for (ggml_tensor* param : params) {
             if (param != nullptr) {
                 graph_cut_layer_split_assignments_[param] = runtime_backend;
             }
         }
-        const int n_nodes = ggml_graph_n_nodes(gf);
         for (int i = 0; i < n_nodes; i++) {
             ggml_tensor* node = ggml_graph_node(gf, i);
             if (node != nullptr) {
@@ -397,14 +428,15 @@ bool GGMLRunner::assign_graph_cut_layer_split_backends(ggml_cgraph* gf) {
             LOG_WARN("%s graph-cut layer split: graph has no mark_graph_cut segments; using primary backend %s for %zu graph params",
                      get_desc().c_str(),
                      sd::layer_split_backend_device_display_name(runtime_backend).c_str(),
-                     graph_params.size());
+                     params.size());
             graph_cut_layer_split_primary_notice_logged_ = true;
         } else {
             LOG_VERBOSE("%s graph-cut layer split: graph has no mark_graph_cut segments; using primary backend %s for %zu graph params",
                         get_desc().c_str(),
                         sd::layer_split_backend_device_display_name(runtime_backend).c_str(),
-                        graph_params.size());
+                        params.size());
         }
+        cache_assignments();
         return true;
     }
 
@@ -415,12 +447,6 @@ bool GGMLRunner::assign_graph_cut_layer_split_backends(ggml_cgraph* gf) {
         if (backend != nullptr) {
             split_backends.push_back(backend);
         }
-    }
-
-    auto manager = residency_manager.lock();
-    if (manager == nullptr) {
-        LOG_ERROR("%s weight manager is not set for graph-cut layer split", get_desc().c_str());
-        return false;
     }
 
     sd::GraphCutLayerSplitAssignment assignment;
@@ -453,6 +479,7 @@ bool GGMLRunner::assign_graph_cut_layer_split_backends(ggml_cgraph* gf) {
 
     graph_cut_layer_split_node_assignments_ = std::move(assignment.node_assignments);
     sd::log_graph_cut_layer_split_assignment(get_desc().c_str(), split_backends, assignment);
+    cache_assignments();
 
     return true;
 }
@@ -494,8 +521,15 @@ void GGMLRunner::runner_end() {
                 tensors.push_back(parameter);
         }
         manager->evict_compute_backend_params(tensors);
+        manager->trim_reclaimable_memory(runtime_backend);
+        for (ggml_backend_t backend : extra_runtime_backends) {
+            manager->trim_reclaimable_memory(backend);
+        }
         manager->remove_runtime_owner(reinterpret_cast<uintptr_t>(this));
     }
+    cross_step_prefetch_segment_ = SIZE_MAX;
+    cross_step_prefetch_params_.clear();
+    cross_step_layout_.clear();
     runner_started_ = false;
 }
 
@@ -666,6 +700,7 @@ void GGMLRunner::set_graph_cut_layer_split_enabled(bool enabled) {
         graph_cut_layer_split_node_assignments_.clear();
         graph_cut_layer_split_primary_notice_logged_ = false;
     }
+    invalidate_layer_split_cache();
 }
 
 void GGMLRunner::set_graph_cut_layer_split_backend_vram_limits(const std::vector<size_t>& limits) {
@@ -673,6 +708,7 @@ void GGMLRunner::set_graph_cut_layer_split_backend_vram_limits(const std::vector
     graph_cut_layer_split_assignments_.clear();
     graph_cut_layer_split_node_assignments_.clear();
     graph_cut_layer_split_primary_notice_logged_ = false;
+    invalidate_layer_split_cache();
 }
 
 void GGMLRunner::set_runtime_backends(const std::vector<ggml_backend_t>& backends) {
@@ -690,6 +726,7 @@ void GGMLRunner::set_runtime_backends(const std::vector<ggml_backend_t>& backend
     graph_cut_layer_split_assignments_.clear();
     graph_cut_layer_split_node_assignments_.clear();
     graph_cut_layer_split_primary_notice_logged_ = false;
+    invalidate_layer_split_cache();
 }
 
 static size_t add_bytes(size_t a, size_t b) {
@@ -710,6 +747,155 @@ ComputeWorkspace::Measurement GGMLRunner::measure(ggml_cgraph* graph, size_t dir
     return workspace_.measure(graph, direct_bytes, external_backend, assign_nodes);
 }
 
+ComputeWorkspace::Measurement GGMLRunner::measure_cached(ggml_cgraph* graph,
+                                                         size_t direct_bytes,
+                                                         const std::vector<uint64_t>& layout,
+                                                         size_t slot,
+                                                         bool inputs_preallocated) {
+    if (layout.empty()) {
+        return measure(graph, direct_bytes);
+    }
+    if (layout != measurement_layout_) {
+        invalidate_measurements();
+        measurement_layout_              = layout;
+        measurement_inputs_preallocated_ = inputs_preallocated;
+    }
+    std::optional<ComputeWorkspace::Measurement>* entry = &full_measurement_;
+    if (slot != SIZE_MAX) {
+        // Segment measurements exclude inputs that were uploaded up front.
+        if (inputs_preallocated != measurement_inputs_preallocated_) {
+            segment_measurements_.clear();
+            measurement_inputs_preallocated_ = inputs_preallocated;
+        }
+        if (segment_measurements_.size() <= slot) {
+            segment_measurements_.resize(slot + 1);
+        }
+        entry = &segment_measurements_[slot];
+    }
+    if (!entry->has_value() || (*entry)->buffers.empty()) {
+        *entry = measure(graph, direct_bytes);
+    }
+    return **entry;
+}
+
+void GGMLRunner::invalidate_measurements() {
+    measurement_layout_.clear();
+    measurement_inputs_preallocated_ = false;
+    segment_measurements_.clear();
+    full_measurement_.reset();
+}
+
+void GGMLRunner::invalidate_layer_split_cache() {
+    layer_split_layout_.clear();
+    layer_split_node_backends_.clear();
+    invalidate_measurements();
+}
+
+size_t GGMLRunner::vram_limit_for(ggml_backend_t backend) const {
+    size_t limit = max_graph_vram_bytes;
+    if (is_multi_device()) {
+        size_t index = 0;
+        if (backend != runtime_backend) {
+            auto position = std::find(extra_runtime_backends.begin(), extra_runtime_backends.end(), backend);
+            index         = static_cast<size_t>(position - extra_runtime_backends.begin()) + 1;
+        }
+        if (index < graph_cut_layer_split_backend_vram_limits_.size()) {
+            limit = graph_cut_layer_split_backend_vram_limits_[index];
+        }
+    }
+    return limit;
+}
+
+bool GGMLRunner::preallocate_graph_inputs(ggml_cgraph* graph) {
+    free_graph_inputs();
+    if (graph == nullptr || sd_backend_is_cpu(runtime_backend) || backend_tensor_data_map.empty()) {
+        return false;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(runtime_backend);
+    if (buft == nullptr) {
+        return false;
+    }
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    const size_t max_size  = ggml_backend_buft_get_max_size(buft);
+    std::vector<ggml_tensor*> inputs;
+    size_t total      = 0;
+    const int n_leafs = sd::ggml_graph_cut::leaf_count(graph);
+    for (int i = 0; i < n_leafs; ++i) {
+        ggml_tensor* leaf = sd::ggml_graph_cut::leaf_tensor(graph, i);
+        if (leaf == nullptr || leaf->buffer != nullptr || leaf->data != nullptr || leaf->view_src != nullptr) {
+            continue;
+        }
+        auto entry = backend_tensor_data_map.find(leaf);
+        if (entry == backend_tensor_data_map.end() || entry->second == nullptr) {
+            continue;
+        }
+        const size_t size = GGML_PAD(ggml_backend_buft_get_alloc_size(buft, leaf), alignment);
+        if (max_size > 0 && size > max_size - std::min(total, max_size)) {
+            return false;
+        }
+        total += size;
+        inputs.push_back(leaf);
+    }
+    if (inputs.empty()) {
+        return false;
+    }
+    total = add_bytes(total, alignment);
+    DeviceMemoryRequest request{runtime_backend, reinterpret_cast<uintptr_t>(this), total,
+                                retained_runtime_buffer_bytes(), vram_limit_for(runtime_backend)};
+    if (!fits({request}, {})) {
+        return false;
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, total);
+    if (buffer == nullptr) {
+        return false;
+    }
+    ggml_tallocr allocator = ggml_tallocr_new(buffer);
+    for (ggml_tensor* input : inputs) {
+        if (ggml_tallocr_alloc(&allocator, input) != GGML_STATUS_SUCCESS) {
+            for (ggml_tensor* bound : inputs) {
+                bound->buffer = nullptr;
+                bound->data   = nullptr;
+                bound->extra  = nullptr;
+            }
+            ggml_backend_buffer_free(buffer);
+            uploaded_inputs_.clear();
+            return false;
+        }
+        ggml_backend_tensor_set(input, backend_tensor_data_map[input], 0, ggml_nbytes(input));
+        uploaded_inputs_.insert(input);
+    }
+    input_buffer_ = buffer;
+    sync_runtime_residency();
+    LOG_DEBUG("%s uploaded %zu graph inputs (%.2f MB) once for segmented execution",
+              get_desc().c_str(), inputs.size(), total / (1024.0 * 1024.0));
+    return true;
+}
+
+void GGMLRunner::free_graph_inputs() {
+    for (const ggml_tensor* input : uploaded_inputs_) {
+        ggml_tensor* tensor = const_cast<ggml_tensor*>(input);
+        tensor->buffer      = nullptr;
+        tensor->data        = nullptr;
+        tensor->extra       = nullptr;
+    }
+    uploaded_inputs_.clear();
+    if (input_buffer_ != nullptr) {
+        ggml_backend_buffer_free(input_buffer_);
+        input_buffer_ = nullptr;
+    }
+}
+
+void GGMLRunner::clear_cross_step_prefetch() {
+    if (cross_step_prefetch_segment_ != SIZE_MAX) {
+        if (auto manager = residency_manager.lock()) {
+            manager->clear_prefetched_params(reinterpret_cast<uintptr_t>(this));
+        }
+    }
+    cross_step_prefetch_segment_ = SIZE_MAX;
+    cross_step_prefetch_params_.clear();
+    cross_step_layout_.clear();
+}
+
 std::vector<DeviceMemoryRequest> GGMLRunner::memory_requests(
     const std::vector<BackendBufferSize>& sizes,
     const std::map<ggml_backend_t, size_t>& pending_cache_bytes) const {
@@ -720,19 +906,8 @@ std::vector<DeviceMemoryRequest> GGMLRunner::memory_requests(
         const auto cache_entry   = pending_cache_bytes.find(size.backend);
         const size_t cache_bytes = cache_entry == pending_cache_bytes.end() ? 0 : cache_entry->second;
         const size_t pending     = add_bytes(size.bytes > reusable ? size.bytes - reusable : 0, cache_bytes);
-        size_t limit             = max_graph_vram_bytes;
-        if (is_multi_device()) {
-            size_t index = 0;
-            if (size.backend != runtime_backend) {
-                auto position = std::find(extra_runtime_backends.begin(), extra_runtime_backends.end(), size.backend);
-                index         = static_cast<size_t>(position - extra_runtime_backends.begin()) + 1;
-            }
-            if (index < graph_cut_layer_split_backend_vram_limits_.size()) {
-                limit = graph_cut_layer_split_backend_vram_limits_[index];
-            }
-        }
         requests.push_back({size.backend, reinterpret_cast<uintptr_t>(this), pending,
-                            retained, limit});
+                            retained, vram_limit_for(size.backend)});
     }
     return requests;
 }
@@ -742,7 +917,7 @@ std::vector<ggml_backend_t> GGMLRunner::segment_backends(const GraphCutPlan& pla
     if (!is_multi_device() || graph_cut_layer_split_node_assignments_.empty() || gf == nullptr) {
         return backends;
     }
-    const int n_nodes = ggml_graph_n_nodes(gf);
+    const int n_nodes    = ggml_graph_n_nodes(gf);
     auto find_assignment = [&](const std::vector<int>& node_indices, ggml_backend_t* backend) {
         for (int node_index : node_indices) {
             if (node_index < 0 || node_index >= n_nodes) {
@@ -848,16 +1023,34 @@ bool GGMLRunner::execute_segment(ggml_cgraph* graph, int n_threads) {
 }
 
 std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n_threads, bool no_return, const std::function<bool()>& read_outputs) {
-    if (!assign_graph_cut_layer_split_backends(graph)) {
+    struct PhaseTiming {
+        int64_t measure  = 0;
+        int64_t weights  = 0;
+        int64_t alloc    = 0;
+        int64_t upload   = 0;
+        int64_t prefetch = 0;
+        int64_t compute  = 0;
+        int64_t capture  = 0;
+    } timing;
+    const int64_t graph_start = ggml_time_us();
+    int64_t phase_start       = graph_start;
+    auto lap                  = [&phase_start](int64_t& bucket) {
+        const int64_t now = ggml_time_us();
+        bucket += now - phase_start;
+        phase_start = now;
+    };
+
+    const auto params       = collect_used_param_tensors(graph);
+    const auto& cached_plan = resolve_graph_cut_plan(graph);
+    if (!assign_graph_cut_layer_split_backends(graph, cached_plan, params)) {
         return std::nullopt;
     }
-    const auto params           = collect_used_param_tensors(graph);
-    const auto& cached_plan     = resolve_graph_cut_plan(graph);
-    const auto full_measurement = measure(graph, cached_plan.compute_buffer_size);
+    auto full_measurement = measure_cached(graph, cached_plan.compute_buffer_size, cached_plan.layout, SIZE_MAX, false);
     if (full_measurement.buffers.empty()) {
         last_compute_status_ = GGML_STATUS_ALLOC_FAILED;
         return std::nullopt;
     }
+    lap(timing.measure);
     auto manager = residency_manager.lock();
     // Multi-device graphs segment too: each segment runs on the device holding
     // its weights and the scheduler copies the residual stream at range
@@ -907,11 +1100,26 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
         LOG_INFO("%s streaming %zu segments across %zu devices (%s)", get_desc().c_str(),
                  plan.segments.size(), segments_per_backend.size(), placement.c_str());
     }
+    // Inputs are uploaded before the bindings capture their buffers, so every
+    // segment reuses the same device copy instead of re-uploading it.
+    const bool inputs_preallocated = segmented && preallocate_graph_inputs(graph);
+    lap(timing.upload);
     SegmentGraphBindings bindings(cut_cache_, plan, graph);
     SegmentWeightPipeline weights(manager, runtime_backend, reinterpret_cast<uintptr_t>(this),
                                   graph, plan, params_tensor_set_,
                                   segmented && manager != nullptr && manager->prefetch_enabled(),
-                                  plan_segment_backends);
+                                  plan_segment_backends,
+                                  segmented);
+    if (cross_step_prefetch_segment_ != SIZE_MAX) {
+        if (segmented && cross_step_layout_ == cached_plan.layout) {
+            weights.adopt_prefetch(cross_step_prefetch_segment_, std::move(cross_step_prefetch_params_));
+            cross_step_prefetch_segment_ = SIZE_MAX;
+            cross_step_prefetch_params_.clear();
+            cross_step_layout_.clear();
+        } else {
+            clear_cross_step_prefetch();
+        }
+    }
 
     std::map<ggml_backend_t, size_t> peak_compute_bytes;
     auto track_compute_buffer = [&](ggml_backend_t backend) {
@@ -954,7 +1162,10 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
             }
         } segment_cleanup{*this, weights, bindings, segment_context};
 
-        auto measurement = segmented ? measure(segment_graph, segment.compute_buffer_size) : full_measurement;
+        auto measurement = segmented
+                               ? measure_cached(segment_graph, segment.compute_buffer_size, cached_plan.layout, index, inputs_preallocated)
+                               : full_measurement;
+        lap(timing.measure);
         if (!workspace_.prepare(measurement)) {
             last_compute_status_ = GGML_STATUS_ALLOC_FAILED;
             return fail_segment("workspace preparation");
@@ -980,19 +1191,44 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
             }
             return ready;
         };
+        std::vector<size_t> reusable_before;
+        reusable_before.reserve(measurement.buffers.size());
+        for (const auto& size : measurement.buffers) {
+            reusable_before.push_back(workspace_.bytes(size.backend));
+        }
         if (!weights.segment_start(index, ensure_capacity)) {
             return fail_segment("weight preparation");
         }
-        // Preparing weights can execute LoRA graphs and reclaim an idle workspace.
+        lap(timing.weights);
+        // Preparing weights can execute LoRA graphs and reclaim an idle workspace;
+        // only then does the capacity check need to run again.
+        bool recheck = false;
         if (!workspace_.measurement_matches(segment_graph, measurement)) {
             measurement = measure(segment_graph, segment.compute_buffer_size);
+            if (segmented && index < segment_measurements_.size() && cached_plan.layout == measurement_layout_) {
+                segment_measurements_[index] = measurement;
+            }
+            recheck = true;
         }
-        if (!workspace_.prepare(measurement)) {
-            last_compute_status_ = GGML_STATUS_ALLOC_FAILED;
-            return fail_segment("workspace preparation");
+        for (size_t i = 0; i < measurement.buffers.size() && !recheck; ++i) {
+            recheck = workspace_.bytes(measurement.buffers[i].backend) < reusable_before[i];
         }
-        if (!ensure_capacity()) {
-            return fail_segment("workspace capacity check");
+        if (recheck) {
+            if (!workspace_.prepare(measurement)) {
+                last_compute_status_ = GGML_STATUS_ALLOC_FAILED;
+                return fail_segment("workspace preparation");
+            }
+            if (!ensure_capacity()) {
+                return fail_segment("workspace capacity check");
+            }
+        }
+        lap(timing.measure);
+        if (manager != nullptr) {
+            for (const auto& size : measurement.buffers) {
+                if (size.bytes > workspace_.bytes(size.backend)) {
+                    manager->trim_reclaimable_memory(size.backend);
+                }
+            }
         }
         if (!workspace_.allocate(segment_graph, [&](ggml_backend_sched_t scheduler, ggml_cgraph* current) {
                 pin_multi_device_nodes(scheduler, current);
@@ -1006,20 +1242,24 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
         if (workspace_.scheduler() != nullptr) {
             track_compute_buffer(workspace_.cpu_backend());
         }
-        if (!ensure_capacity()) {
-            return fail_segment("allocated capacity check");
-        }
+        lap(timing.alloc);
         copy_data_to_backend_tensor(segment_graph, false);
+        lap(timing.upload);
         weights.enqueue_next(index, memory_requests(measurement.buffers, new_cache_bytes));
+        lap(timing.prefetch);
         LOG_DEBUG("%s executing segment %zu/%zu: %s on %s", get_desc().c_str(),
                   index + 1, plan.segments.size(), segment.group_name.c_str(),
                   ggml_backend_name(segment_backend));
-        if (!execute_segment(segment_graph, n_threads) ||
-            !cache_.capture(segment_graph) ||
+        if (!execute_segment(segment_graph, n_threads)) {
+            return fail_segment("execution");
+        }
+        lap(timing.compute);
+        if (!cache_.capture(segment_graph) ||
             !cut_cache_.capture(graph, segment, get_desc().c_str(), segment_backend)) {
-            return fail_segment("execution or output caching");
+            return fail_segment("output caching");
         }
         sync_runtime_residency();
+        lap(timing.capture);
         if (last) {
             if (read_outputs && !read_outputs()) {
                 return fail_segment("output finalization");
@@ -1039,6 +1279,10 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
         // Final outputs and their callbacks may still be views of consumed cuts.
         cut_cache_.prune(segment.future_cut_names);
     }
+    weights.take_cross_step_prefetch(&cross_step_prefetch_segment_, &cross_step_prefetch_params_);
+    if (cross_step_prefetch_segment_ != SIZE_MAX) {
+        cross_step_layout_ = cached_plan.layout;
+    }
     if (segments_changed || peak_compute_bytes != logged_compute_bytes_) {
         for (const auto& entry : peak_compute_bytes) {
             LOG_VERBOSE("%s compute buffer size: %.2f MB(%s) on %s (peak across %zu segment%s)",
@@ -1049,5 +1293,10 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
         logged_compute_bytes_ = std::move(peak_compute_bytes);
         logged_segment_count_ = plan.segments.size();
     }
+    LOG_DEBUG("%s graph timing (%zu segment%s): measure %.1f ms, weights %.1f ms, alloc %.1f ms, upload %.1f ms, prefetch %.1f ms, compute %.1f ms, capture %.1f ms, total %.1f ms",
+              get_desc().c_str(), plan.segments.size(), plan.segments.size() == 1 ? "" : "s",
+              timing.measure / 1000.0, timing.weights / 1000.0, timing.alloc / 1000.0, timing.upload / 1000.0,
+              timing.prefetch / 1000.0, timing.compute / 1000.0, timing.capture / 1000.0,
+              (ggml_time_us() - graph_start) / 1000.0);
     return output;
 }

@@ -65,11 +65,14 @@ sd-cli -m model.safetensors -p "a cat" --backend "diffusion=cuda0&cuda1"
 ```
 
 The module's transformer blocks are then distributed across the listed devices
-in contiguous ranges sized proportionally to each device's free memory (minus a
-compute-buffer headroom of about 2 GiB per device), and the
-module's graphs are executed with a `ggml_backend_sched` that runs each block
-on the device holding its weights, copying the residual stream at the range
-boundaries. The first device in the list is the module's main device: it also
+in contiguous ranges: the first device is filled up to its free memory (minus a
+compute-buffer headroom of about 2 GiB per device) before the next one receives
+blocks, so a model that fits on the first device stays there. Only when the
+weights exceed the combined budget are they spread proportionally to each
+device's budget. The module's graphs are executed with a `ggml_backend_sched`
+that runs each block on the device holding its weights, copying the residual
+stream at the range boundaries. Execution is sequential across devices: a
+split does not run blocks on two GPUs at the same time. The first device in the list is the module's main device: it also
 holds the non-block tensors (embeddings, final norms, small sub-runners such as
 CLIP models or projectors) and the graph inputs/outputs.
 

@@ -69,8 +69,17 @@ private:
         ggml_backend_t compute_backend = nullptr;
         ggml_backend_buffer_t buffer   = nullptr;
         ggml_context* staging_ctx      = nullptr;
+        bool pooled                    = false;
         std::vector<std::pair<TensorState*, ggml_tensor*>> staged_tensors;
     };
+
+    // Released staging buffers are kept briefly so the next segment reuses
+    // them instead of paying a device allocation and free per segment.
+    struct PooledStagingBuffer {
+        ggml_backend_buffer_t buffer = nullptr;
+        size_t size                  = 0;
+    };
+    static constexpr size_t MAX_POOLED_STAGING_BUFFERS = 2;
 
     struct PrefetchBlock {
         std::vector<TensorState*> states;
@@ -96,6 +105,7 @@ private:
     mutable std::list<ResolvedTensorStates> resolved_tensor_states_;
     std::vector<std::unique_ptr<ParamsStorageBlock>> params_storage_blocks_;
     std::vector<std::unique_ptr<ComputeStagingBlock>> compute_staging_blocks_;
+    std::map<ggml_backend_buffer_type_t, std::vector<PooledStagingBuffer>> staging_buffer_pool_;
     std::map<ggml_backend_t, ggml_backend_buffer_type_t> split_buffer_types_;
     std::map<ggml_backend_buffer_type_t, std::vector<std::pair<ggml_backend_t, size_t>>> split_buffer_devices_;
     std::map<uintptr_t, std::unique_ptr<PrefetchBlock>> prefetch_blocks_;
@@ -123,6 +133,13 @@ private:
     ggml_backend_t prefetch_backend_for(ggml_backend_t compute_backend);
     bool populate_prefetch_block(PrefetchBlock& block);
     void synchronize_prefetch_block(PrefetchBlock& block);
+    void wait_prefetch_block(PrefetchBlock& block);
+    ggml_backend_buffer_t acquire_staging_buffer(ggml_backend_buffer_type_t buffer_type, size_t size);
+    void release_staging_buffer(ggml_backend_buffer_t buffer, bool pooled);
+    void trim_staging_buffer_pool(ggml_backend_dev_t device);
+    size_t pooled_staging_bytes(ggml_backend_dev_t device) const;
+    bool bind_staging_tensors(ggml_backend_buffer_t buffer,
+                              const std::vector<std::pair<TensorState*, ggml_tensor*>>& tensors) const;
     void free_prefetch_block(PrefetchBlock& block);
     void clear_all_prefetched_params();
     void release_prefetch();
@@ -293,6 +310,7 @@ public:
     bool activate_prefetched_params(uintptr_t owner_id,
                                     const std::vector<ggml_tensor*>& tensors) override;
     void clear_prefetched_params(uintptr_t owner_id) override;
+    void trim_reclaimable_memory(ggml_backend_t compute_backend) override;
 };
 
 #endif  // __MODEL_MANAGER_H__

@@ -133,7 +133,36 @@ private:
     size_t logged_segment_count_     = 0;
     ggml_status last_compute_status_ = GGML_STATUS_SUCCESS;
 
+    // Layer split placement and workspace measurements only depend on the graph
+    // layout, so they are cached across the graphs of a sampling loop.
+    std::vector<uint64_t> layer_split_layout_;
+    std::vector<ggml_backend_t> layer_split_node_backends_;
+    std::vector<uint64_t> measurement_layout_;
+    bool measurement_inputs_preallocated_ = false;
+    std::vector<std::optional<sd::ComputeWorkspace::Measurement>> segment_measurements_;
+    std::optional<sd::ComputeWorkspace::Measurement> full_measurement_;
+
+    // Segmented graphs upload their external inputs once instead of once per segment.
+    ggml_backend_buffer_t input_buffer_ = nullptr;
+    std::unordered_set<const ggml_tensor*> uploaded_inputs_;
+
+    // Weights prefetched during the last segment for the first segment of the next graph.
+    std::vector<uint64_t> cross_step_layout_;
+    std::vector<ggml_tensor*> cross_step_prefetch_params_;
+    size_t cross_step_prefetch_segment_ = SIZE_MAX;
+
     sd::ComputeWorkspace::Measurement measure(ggml_cgraph* graph, size_t direct_bytes);
+    sd::ComputeWorkspace::Measurement measure_cached(ggml_cgraph* graph,
+                                                     size_t direct_bytes,
+                                                     const std::vector<uint64_t>& layout,
+                                                     size_t slot,
+                                                     bool inputs_preallocated);
+    void invalidate_measurements();
+    void invalidate_layer_split_cache();
+    size_t vram_limit_for(ggml_backend_t backend) const;
+    bool preallocate_graph_inputs(ggml_cgraph* graph);
+    void free_graph_inputs();
+    void clear_cross_step_prefetch();
     std::vector<DeviceMemoryRequest> memory_requests(const std::vector<sd::BackendBufferSize>& sizes,
                                                      const std::map<ggml_backend_t, size_t>& pending_cache_bytes) const;
     bool fits(const std::vector<DeviceMemoryRequest>& requests,
@@ -272,7 +301,9 @@ protected:
 
     const GraphCutPlan& resolve_graph_cut_layer_split_plan(ggml_cgraph* gf);
 
-    bool assign_graph_cut_layer_split_backends(ggml_cgraph* gf);
+    bool assign_graph_cut_layer_split_backends(ggml_cgraph* gf,
+                                               const GraphCutPlan& plan,
+                                               const std::vector<ggml_tensor*>& params);
 
     // Device that runs each segment of a plan: the layer split assignment of its
     // nodes, or the primary backend for single-device execution.
@@ -350,6 +381,7 @@ public:
         if (sage_attn_enabled != enabled) {
             free_cache_ctx_and_buffer();
             graph_cut_plan_cache_.graph_cut_plans.clear();
+            invalidate_measurements();
             sage_attn_enabled = enabled;
         }
     }

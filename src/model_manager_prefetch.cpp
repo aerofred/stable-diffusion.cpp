@@ -39,6 +39,18 @@ void ModelManager::synchronize_prefetch_block(PrefetchBlock& block) {
     block.transfer_backend = nullptr;
 }
 
+void ModelManager::wait_prefetch_block(PrefetchBlock& block) {
+    // The compute stream waits for the transfer instead of the host; the
+    // transfer backend stays recorded so a later cancel can still host-sync.
+    if (block.event != nullptr && block.compute_backend != nullptr) {
+        ggml_backend_event_wait(block.compute_backend, block.event);
+        ggml_backend_event_free(block.event);
+        block.event = nullptr;
+        return;
+    }
+    synchronize_prefetch_block(block);
+}
+
 void ModelManager::free_prefetch_block(PrefetchBlock& block) {
     synchronize_prefetch_block(block);
     for (auto& staging_block : block.staging_blocks) {
@@ -47,7 +59,7 @@ void ModelManager::free_prefetch_block(PrefetchBlock& block) {
         }
         staging_block->staged_tensors.clear();
         if (staging_block->buffer != nullptr) {
-            ggml_backend_buffer_free(staging_block->buffer);
+            release_staging_buffer(staging_block->buffer, staging_block->pooled);
             staging_block->buffer = nullptr;
         }
         if (staging_block->staging_ctx != nullptr) {
@@ -89,7 +101,7 @@ bool ModelManager::populate_prefetch_block(PrefetchBlock& block) {
         backend_limit = MAX_RESIDENCY_BLOCK_BYTES;
     }
 
-    auto enqueue_chunk = [&](const std::vector<TensorState*>& chunk) -> bool {
+    auto enqueue_chunk = [&](const std::vector<TensorState*>& chunk, size_t chunk_bytes) -> bool {
         if (chunk.empty()) {
             return true;
         }
@@ -118,13 +130,18 @@ bool ModelManager::populate_prefetch_block(PrefetchBlock& block) {
             }
             staging_block->staged_tensors.push_back({state, staging_tensor});
         }
-        staging_block->buffer =
-            ggml_backend_alloc_ctx_tensors_from_buft(staging_ctx, buffer_type);
+        staging_block->buffer = acquire_staging_buffer(buffer_type, chunk_bytes + alignment);
+        if (staging_block->buffer != nullptr &&
+            !bind_staging_tensors(staging_block->buffer, staging_block->staged_tensors)) {
+            ggml_backend_buffer_free(staging_block->buffer);
+            staging_block->buffer = nullptr;
+        }
         if (staging_block->buffer == nullptr) {
             ggml_free(staging_ctx);
             staging_block->staging_ctx = nullptr;
             return false;
         }
+        staging_block->pooled = true;
         ggml_backend_buffer_set_usage(staging_block->buffer,
                                       GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
@@ -156,7 +173,7 @@ bool ModelManager::populate_prefetch_block(PrefetchBlock& block) {
             ggml_backend_buft_get_alloc_size(buffer_type, state->tensor), alignment);
         if (!chunk.empty() && backend_limit > 0 &&
             tensor_size > backend_limit - std::min(chunk_size, backend_limit)) {
-            if (!enqueue_chunk(chunk)) {
+            if (!enqueue_chunk(chunk, chunk_size)) {
                 return false;
             }
             chunk.clear();
@@ -165,7 +182,7 @@ bool ModelManager::populate_prefetch_block(PrefetchBlock& block) {
         chunk.push_back(state);
         chunk_size = tensor_size > SIZE_MAX - chunk_size ? SIZE_MAX : chunk_size + tensor_size;
     }
-    if (!enqueue_chunk(chunk)) {
+    if (!enqueue_chunk(chunk, chunk_size)) {
         return false;
     }
 
@@ -289,7 +306,7 @@ bool ModelManager::activate_prefetched_params(
     }
     std::unique_ptr<PrefetchBlock> block = std::move(existing->second);
     prefetch_blocks_.erase(existing);
-    synchronize_prefetch_block(*block);
+    wait_prefetch_block(*block);
 
     for (const auto& staging_block : block->staging_blocks) {
         if (staging_block == nullptr) {

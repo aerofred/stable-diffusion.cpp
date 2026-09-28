@@ -25,12 +25,14 @@ namespace sd {
         const ggml_graph_cut::Plan& plan,
         const std::unordered_set<const ggml_tensor*>& params,
         bool enabled,
-        const std::vector<ggml_backend_t>& segment_backends)
+        const std::vector<ggml_backend_t>& segment_backends,
+        bool wrap_prefetch)
         : residency_manager_(residency_manager),
           compute_backend_(compute_backend),
           owner_id_(owner_id),
           segment_backends_(segment_backends),
-          enabled_(enabled && residency_manager != nullptr) {
+          enabled_(enabled && residency_manager != nullptr),
+          wrap_prefetch_(wrap_prefetch) {
         segment_params_.resize(plan.segments.size());
         for (size_t segment_index = 0; segment_index < plan.segments.size(); ++segment_index) {
             std::unordered_set<ggml_tensor*> seen;
@@ -55,7 +57,38 @@ namespace sd {
                 return next;
             }
         }
+        if (wrap_prefetch_) {
+            for (size_t next = 0; next < segment_index && next < segment_params_.size(); ++next) {
+                if (!segment_params_[next].empty()) {
+                    return next;
+                }
+            }
+        }
         return SIZE_MAX;
+    }
+
+    void SegmentWeightPipeline::adopt_prefetch(size_t segment_index, std::vector<ggml_tensor*> params) {
+        if (!enabled_ || segment_index >= segment_params_.size() || params.empty()) {
+            clear();
+            return;
+        }
+        queued_params_     = std::move(params);
+        queued_segment_    = segment_index;
+        queued_cross_step_ = false;
+    }
+
+    void SegmentWeightPipeline::take_cross_step_prefetch(size_t* segment_index, std::vector<ggml_tensor*>* params) {
+        GGML_ASSERT(segment_index != nullptr && params != nullptr);
+        if (queued_segment_ == SIZE_MAX || !queued_cross_step_) {
+            *segment_index = SIZE_MAX;
+            params->clear();
+            return;
+        }
+        *segment_index = queued_segment_;
+        *params        = std::move(queued_params_);
+        queued_params_.clear();
+        queued_segment_    = SIZE_MAX;
+        queued_cross_step_ = false;
     }
 
     ggml_backend_t SegmentWeightPipeline::segment_backend(size_t segment_index) const {
@@ -80,13 +113,16 @@ namespace sd {
         }
 
         auto manager = residency_manager_.lock();
-        if (manager == nullptr ||
-            !manager->activate_prefetched_params(owner_id_, queued_params_)) {
+        if (manager == nullptr) {
             disable();
             return;
         }
+        // A cancelled or stale prefetch falls back to synchronous staging for
+        // this segment only; later segments can still be prefetched.
+        manager->activate_prefetched_params(owner_id_, queued_params_);
         queued_params_.clear();
-        queued_segment_ = SIZE_MAX;
+        queued_segment_    = SIZE_MAX;
+        queued_cross_step_ = false;
     }
 
     bool SegmentWeightPipeline::ensure_segment_capacity(
@@ -197,8 +233,9 @@ namespace sd {
         }
         switch (manager->prefetch_params(owner_id_, params)) {
             case WeightPrefetchResult::Scheduled:
-                queued_params_  = std::move(params);
-                queued_segment_ = next_segment;
+                queued_params_     = std::move(params);
+                queued_segment_    = next_segment;
+                queued_cross_step_ = next_segment <= segment_index;
                 return;
             case WeightPrefetchResult::AlreadyResident:
                 return;
@@ -213,10 +250,15 @@ namespace sd {
     }
 
     void SegmentWeightPipeline::clear() {
-        if (auto manager = residency_manager_.lock()) {
-            manager->clear_prefetched_params(owner_id_);
+        // A prefetch handed to the runner (take_cross_step_prefetch) stays queued
+        // in the manager for the next graph.
+        if (queued_segment_ != SIZE_MAX) {
+            if (auto manager = residency_manager_.lock()) {
+                manager->clear_prefetched_params(owner_id_);
+            }
         }
         queued_params_.clear();
-        queued_segment_ = SIZE_MAX;
+        queued_segment_    = SIZE_MAX;
+        queued_cross_step_ = false;
     }
 }

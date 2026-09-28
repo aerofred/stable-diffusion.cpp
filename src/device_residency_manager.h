@@ -68,6 +68,9 @@ struct DeviceResidencyManager {
     virtual bool activate_prefetched_params(uintptr_t owner_id,
                                             const std::vector<ggml_tensor*>& tensors) = 0;
     virtual void clear_prefetched_params(uintptr_t owner_id)                          = 0;
+    // Frees device memory the manager keeps only as an optimization (pooled
+    // staging buffers); called before a runner allocates a larger workspace.
+    virtual void trim_reclaimable_memory(ggml_backend_t compute_backend) { (void)compute_backend; }
 };
 
 // Transitional alias for model constructors that have not yet adopted the
