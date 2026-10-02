@@ -56,6 +56,7 @@ Current endpoints include:
 - `GET /sdcpp/v1/jobs/{id}`
 - `POST /sdcpp/v1/jobs/{id}/cancel`
 - `POST /sdcpp/v1/vid_gen`
+- `POST /sdcpp/v1/upscale`
 
 ## `sd_cpp_extra_args`
 
@@ -434,7 +435,8 @@ Top-level fields:
 | `samplers` | `array<string>` | Available sampling methods |
 | `schedulers` | `array<string>` | Available schedulers |
 | `loras` | `array<object>` | Available LoRA entries |
-| `upscalers` | `array<object>` | Available model-backed highres upscalers |
+| `upscalers` | `array<object>` | Available highres upscalers, built-in and model-backed |
+| `upscale` | `boolean` | Whether a compatible RGB ESRGAN model is available for `POST /sdcpp/v1/upscale` |
 | `limits` | `object` | Shared queue and size limits |
 
 `model`
@@ -476,6 +478,8 @@ Shared nested fields:
 | Field | Type | Notes |
 | --- | --- | --- |
 | `upscalers[].name` | `string` | Built-in name or model stem; use this value in `hires.upscaler` |
+| `upscalers[].model` | `boolean` | True for a model-backed upscaler, false for a built-in scaling filter |
+| `upscalers[].image_upscale` | `boolean` | Whether this model can be selected by `POST /sdcpp/v1/upscale`; false for latent upscalers and built-in filters |
 
 Built-in entries include `None`, `Lanczos`, `Nearest`, `Latent`, `Latent (nearest)`, `Latent (nearest-exact)`, `Latent (antialiased)`, `Latent (bicubic)`, and `Latent (bicubic antialiased)`. Model-backed entries are scanned from the top level of `--hires-upscalers-dir`; subdirectories are not scanned.
 
@@ -489,6 +493,8 @@ Built-in entries include `None`, `Lanczos`, `Nearest`, `Latent`, `Latent (neares
 | `limits.max_height` | `integer` |
 | `limits.max_batch_count` | `integer` |
 | `limits.max_queue_size` | `integer` |
+| `limits.max_upscale_width` | `integer` |
+| `limits.max_upscale_height` | `integer` |
 
 Shared default fields used by both `img_gen` and `vid_gen`:
 
@@ -518,11 +524,11 @@ Shared default fields used by both `img_gen` and `vid_gen`:
 | `vae_tiling_params` | `object` |
 | `vae_tiling_params.enabled` | `boolean` |
 | `vae_tiling_params.temporal_tiling` | `boolean` |
-| `vae_tiling_params.tile_size_x` | `integer` |
-| `vae_tiling_params.tile_size_y` | `integer` |
+| `vae_tiling_params.tile_size_w` | `integer` |
+| `vae_tiling_params.tile_size_h` | `integer` |
 | `vae_tiling_params.target_overlap` | `number` |
-| `vae_tiling_params.rel_size_x` | `number` |
-| `vae_tiling_params.rel_size_y` | `number` |
+| `vae_tiling_params.rel_size_w` | `number` |
+| `vae_tiling_params.rel_size_h` | `number` |
 | `vae_tiling_params.extra_tiling_args` | `string` |
 | `cache_mode` | `string` |
 | `cache_option` | `string` |
@@ -530,6 +536,8 @@ Shared default fields used by both `img_gen` and `vid_gen`:
 | `scm_policy_dynamic` | `boolean` |
 | `output_format` | `string` |
 | `output_compression` | `integer` |
+
+`vae_tiling_params.tile_size_w` and `tile_size_h` are in **image pixels**, with `0` selecting the 256-pixel default. Both encode and decode use these sizes without an encoding multiplier. Positive `rel_size_w`/`rel_size_h` values override the corresponding absolute size: values up to 1 are dimension fractions, and values greater than 1 are target tile counts. Set `enabled` to use spatial tiling. Sizes are aligned down to the VAE scale factor and capped at the input dimensions; explicit sizes below the minimum supported tile size are rejected. These fields previously used latent units; see [VAE tiling](../../docs/performance.md#use-vae-tiling-to-reduce-encode-and-decode-memory-usage) for migration and OOM retry behavior.
 
 `vae_tiling_params.extra_tiling_args` accepts a key=value list. Supported video VAEs accept `temporal_tile_frames` (alias `temporal_tile_size`, default `4`) and `temporal_tile_overlap` (default `1`).
 LTX and Wan preserve causal state between temporal tiles. Hunyuan Video and TAEHV use overlap blending. MiniMax H3 keeps its model-specific fixed temporal windows because its latent-to-frame mapping is non-linear.
@@ -641,6 +649,52 @@ Typical status codes:
 - `404 Not Found`
 - `410 Gone`
 
+#### `POST /sdcpp/v1/upscale`
+
+Runs one RGB ESRGAN upscaler over an image, with no generation involved. Latent upscaler models remain available for hires generation but cannot be used here.
+
+This is the HTTP equivalent of `sd-cli -M upscale`: no diffusion model, text
+encoder or sampling is used, so it is fast enough to answer synchronously and
+does not create a job.
+
+Request fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `image` | `string` | Required. Base64 or data URL image |
+| `upscaler` | `string` | A name from `upscalers` with `image_upscale: true`; the first compatible entry when omitted |
+| `repeats` | `integer` | Run the upscaler this many times, 1 to 4 (default `1`) |
+| `tile_size` | `integer` | Tile size, defaulting to the server's `--upscale-tile-size` |
+| `output_format` | `string` | `png`, `jpeg`, or `webp` when built with WebP support (default `png`); unsupported formats return 400 |
+| `output_compression` | `integer` | Range is clamped to `0..100` |
+
+Response fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `images` | `array<object>` | One image |
+| `images[].index` | `integer` | |
+| `images[].b64_json` | `string` | Base64-encoded image bytes |
+| `upscaler` | `string` | The upscaler actually used |
+| `scale` | `integer` | The model's scale factor |
+| `repeats` | `integer` | How many times it was run |
+| `width` | `integer` | Result width |
+| `height` | `integer` | Result height |
+| `output_format` | `string` | Final encoded image format |
+
+Typical status codes:
+
+- `200 OK`
+- `400 Bad Request` (invalid request, unsupported output format, unreadable image, incompatible upscaler, or output dimensions exceeding the limit)
+- `500 Internal Server Error`
+
+Notes:
+
+- Final output dimensions, including all repeats, must not exceed 8192 pixels on either axis (`limits.max_upscale_width` and `limits.max_upscale_height`). Requests exceeding this bound are rejected before upscaling.
+- The upscaler models are three-channel; alpha is not preserved.
+- The request holds the generation context lock, so an upscale and a
+  generation never run on the device at the same time.
+
 #### `POST /sdcpp/v1/jobs/{id}/cancel`
 
 Attempts to cancel an accepted job.
@@ -715,11 +769,11 @@ Example:
   "vae_tiling_params": {
     "enabled": false,
     "temporal_tiling": false,
-    "tile_size_x": 0,
-    "tile_size_y": 0,
+    "tile_size_w": 0,
+    "tile_size_h": 0,
     "target_overlap": 0.5,
-    "rel_size_x": 0.0,
-    "rel_size_y": 0.0,
+    "rel_size_w": 0.0,
+    "rel_size_h": 0.0,
     "extra_tiling_args": ""
   },
 
@@ -848,11 +902,11 @@ Other native fields:
 | `vae_tiling_params` | `object` |
 | `vae_tiling_params.enabled` | `boolean` |
 | `vae_tiling_params.temporal_tiling` | `boolean` |
-| `vae_tiling_params.tile_size_x` | `integer` |
-| `vae_tiling_params.tile_size_y` | `integer` |
+| `vae_tiling_params.tile_size_w` | `integer` |
+| `vae_tiling_params.tile_size_h` | `integer` |
 | `vae_tiling_params.target_overlap` | `number` |
-| `vae_tiling_params.rel_size_x` | `number` |
-| `vae_tiling_params.rel_size_y` | `number` |
+| `vae_tiling_params.rel_size_w` | `number` |
+| `vae_tiling_params.rel_size_h` | `number` |
 | `vae_tiling_params.extra_tiling_args` | `string` |
 | `cache_mode` | `string` |
 | `cache_option` | `string` |
@@ -1063,11 +1117,11 @@ Example:
   "vae_tiling_params": {
     "enabled": false,
     "temporal_tiling": false,
-    "tile_size_x": 0,
-    "tile_size_y": 0,
+    "tile_size_w": 0,
+    "tile_size_h": 0,
     "target_overlap": 0.5,
-    "rel_size_x": 0.0,
-    "rel_size_y": 0.0,
+    "rel_size_w": 0.0,
+    "rel_size_h": 0.0,
     "extra_tiling_args": ""
   },
 
@@ -1188,11 +1242,11 @@ Other native fields:
 | `vae_tiling_params` | `object` |
 | `vae_tiling_params.enabled` | `boolean` |
 | `vae_tiling_params.temporal_tiling` | `boolean` |
-| `vae_tiling_params.tile_size_x` | `integer` |
-| `vae_tiling_params.tile_size_y` | `integer` |
+| `vae_tiling_params.tile_size_w` | `integer` |
+| `vae_tiling_params.tile_size_h` | `integer` |
 | `vae_tiling_params.target_overlap` | `number` |
-| `vae_tiling_params.rel_size_x` | `number` |
-| `vae_tiling_params.rel_size_y` | `number` |
+| `vae_tiling_params.rel_size_w` | `number` |
+| `vae_tiling_params.rel_size_h` | `number` |
 | `vae_tiling_params.extra_tiling_args` | `string` |
 | `cache_mode` | `string` |
 | `cache_option` | `string` |

@@ -255,14 +255,20 @@ ggml_tensor* ggml_ext_linear_i8_tensorwise(ggml_context* ctx,
     }
 
     ggml_tensor* fused_bias = scale == 1.f ? b : nullptr;
+    auto mul_mat            = [&](ggml_tensor* input) {
+        if (input->type == GGML_TYPE_F32 && convrot_group_size > 0) {
+            input = ggml_quantize_i8_convrot(ctx, input, convrot_group_size);
+        }
+        return ggml_mul_mat_i8_tensorwise(ctx, w, input, weight_scale, fused_bias, convrot_group_size);
+    };
     if (x->ne[2] * x->ne[3] > 1024) {
         int64_t ne2 = x->ne[2];
         int64_t ne3 = x->ne[3];
         x           = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1] * x->ne[2] * x->ne[3]);
-        x           = ggml_mul_mat_i8_tensorwise(ctx, w, x, weight_scale, fused_bias, convrot_group_size);
+        x           = mul_mat(x);
         x           = ggml_reshape_4d(ctx, x, x->ne[0], x->ne[1] / ne2 / ne3, ne2, ne3);
     } else {
-        x = ggml_mul_mat_i8_tensorwise(ctx, w, x, weight_scale, fused_bias, convrot_group_size);
+        x = mul_mat(x);
     }
 
     if (scale != 1.f) {
@@ -465,7 +471,11 @@ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
                               int d1,
                               int d2,
                               bool force_prec_f32,
-                              bool direct) {
+                              bool direct,
+                              float scale) {
+    if (scale != 1.f) {
+        x = ggml_ext_scale(ctx, x, scale);
+    }
     if (direct) {
         int64_t OC = w->ne[3] / IC;
         int64_t N  = x->ne[3] / IC;
@@ -502,6 +512,9 @@ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
         }
     }
 
+    if (scale != 1.f) {
+        x = ggml_ext_scale(ctx, x, 1.f / scale);
+    }
     if (b != nullptr) {
         b = ggml_reshape_4d(ctx, b, 1, 1, 1, b->ne[0]);  // [OC, 1, 1, 1]
         x = ggml_add_inplace(ctx, x, b);
@@ -623,7 +636,11 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                     bool skip_reshape,
                                     bool flash_attn,
                                     float kv_scale,
-                                    bool sage_attn) {  // avoid overflow
+                                    bool sage_attn,
+                                    bool* used_flash_attn) {  // avoid overflow
+    if (used_flash_attn != nullptr) {
+        *used_flash_attn = false;
+    }
     int64_t L_q;
     int64_t L_k;
     int64_t C;
@@ -755,6 +772,9 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         if (can_use_flash_attn) {
             kqv = build_kqv(q, k, v, mask);
             if (kqv != nullptr) {
+                if (used_flash_attn != nullptr) {
+                    *used_flash_attn = true;
+                }
                 kqv = ggml_view_4d(ctx,
                                    kqv,
                                    d_head,
