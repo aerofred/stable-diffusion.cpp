@@ -199,7 +199,8 @@ namespace sd::model_builders {
             result.diffusion   = std::make_shared<LTXV::LTXAVRunner>(diffusion_backend(ctx),
                                                                      tensor_storage_map,
                                                                      "model.diffusion_model",
-                                                                     weight_manager);
+                                                                     weight_manager,
+                                                                     sd_ctx_params->model_args);
         } else if (sd_version_is_minimax_h3(version)) {
             result.conditioner = std::make_shared<LLMEmbedder>(ctx.backends.runtime_backend(SDBackendModule::TE),
                                                                tensor_storage_map,

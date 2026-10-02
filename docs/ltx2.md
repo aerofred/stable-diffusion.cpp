@@ -44,6 +44,22 @@ you pass.
 - Download the LTX spatial latent upscaler
     - safetensors: https://huggingface.co/Lightricks/LTX-2.5/blob/main/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors
 
+## Memory: token chunking inside the blocks
+
+At high resolutions or frame counts the per-block compute buffer is dominated
+by temporaries that scale with the token count: the feed-forward intermediates
+(4 x the hidden size per token in f32) and, in the attention layers, the query
+projection, its rope copies and the attention output. The block therefore runs
+these stages by token ranges when the sequence is long: K and V are prepared
+once, queries and the feed-forward are processed range by range with the
+modulation sliced accordingly, and the temporaries of one range are released
+before the next. The amount of compute is unchanged and the results match the
+unchunked path up to floating-point blocking; only the compute buffer shrinks,
+which lets more frames or a higher resolution fit on one GPU. Ranges are sized
+automatically (about 256 MiB of temporaries per stage); `--model-args
+token_chunk=N` forces N tokens per range and `token_chunk=0` disables it. It
+requires flash attention for the attention stage (`--diffusion-fa`).
+
 To run the text encoder quantized, convert it once with sd-cli:
 
 ```
