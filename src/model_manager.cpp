@@ -1165,6 +1165,7 @@ bool ModelManager::bind_staging_tensors(ggml_backend_buffer_t buffer,
 }
 
 void ModelManager::trim_reclaimable_memory(ggml_backend_t compute_backend) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (compute_backend == nullptr) {
         return;
     }
@@ -1315,6 +1316,7 @@ void ModelManager::release_all() {
 }
 
 ggml_tensor* ModelManager::resolve_param_tensor(ggml_tensor* tensor) const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     for (auto* current = tensor; current != nullptr; current = current->view_src) {
         if (tensor_states_by_tensor_.count(current) != 0)
             return current;
@@ -1379,6 +1381,7 @@ bool ModelManager::resolve_required_tensor_states(const std::vector<ggml_tensor*
 
 bool ModelManager::assign_compute_backend(const std::vector<ggml_tensor*>& tensors,
                                           ggml_backend_t compute_backend) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (tensors.empty()) {
         return true;
     }
@@ -1531,6 +1534,7 @@ size_t ModelManager::compute_backend_resident_bytes(ggml_backend_t compute_backe
 void ModelManager::update_runtime_residency(uintptr_t owner_id,
                                             ggml_backend_t compute_backend,
                                             size_t resident_bytes) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (owner_id == 0) {
         return;
     }
@@ -1564,6 +1568,7 @@ size_t ModelManager::other_runtime_resident_bytes(uintptr_t owner_id,
 }
 
 bool ModelManager::prepare_params(const std::vector<ggml_tensor*>& tensors) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (tensors.empty()) {
         return true;
     }
@@ -1617,6 +1622,7 @@ void ModelManager::finish_compute_backend_usage(const std::vector<TensorState*>&
 }
 
 void ModelManager::release_compute_backend_params(const std::vector<ggml_tensor*>& tensors) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (tensors.empty()) {
         return;
     }
@@ -1628,6 +1634,7 @@ void ModelManager::release_compute_backend_params(const std::vector<ggml_tensor*
 }
 
 void ModelManager::evict_compute_backend_params(const std::vector<ggml_tensor*>& tensors) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (tensors.empty()) {
         return;
     }
@@ -1683,6 +1690,7 @@ void ModelManager::evict_compute_backend_params(const std::vector<ggml_tensor*>&
 }
 WeightResidencyInfo ModelManager::inspect_compute_backend_params(
     const std::vector<ggml_tensor*>& tensors) const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     WeightResidencyInfo info;
     std::vector<TensorState*> states;
     if (!resolve_required_tensor_states(tensors, states)) {
@@ -1731,11 +1739,13 @@ WeightResidencyInfo ModelManager::inspect_compute_backend_params(
     return info;
 }
 
-void ModelManager::set_workspace_reclaimer(uintptr_t owner_id, std::function<bool()> reclaim) {
+void ModelManager::set_workspace_reclaimer(uintptr_t owner_id, std::function<bool(ggml_backend_t)> reclaim) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     workspace_reclaimers_[owner_id] = std::move(reclaim);
 }
 
 void ModelManager::remove_runtime_owner(uintptr_t owner_id) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     workspace_reclaimers_.erase(owner_id);
     for (auto it = runtime_residencies_.begin(); it != runtime_residencies_.end();) {
         if (it->first.first == owner_id) {
@@ -1833,6 +1843,7 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
 bool ModelManager::fits_compute_backend_capacity(
     const DeviceMemoryRequest& request,
     const std::vector<ggml_tensor*>& required_params) const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     std::vector<TensorState*> states;
     return resolve_required_tensor_states(required_params, states, request.compute_backend) &&
            check_capacity(request, states).fits();
@@ -1843,6 +1854,7 @@ bool ModelManager::ensure_compute_backend_capacity(
     const std::vector<ggml_tensor*>& required_params,
     const std::vector<std::vector<ggml_tensor*>>& preferred_eviction_order,
     const std::vector<ggml_tensor*>& protected_params) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     std::vector<TensorState*> required_states;
     if (!resolve_required_tensor_states(required_params, required_states, request.compute_backend)) {
         return false;
@@ -1870,7 +1882,7 @@ bool ModelManager::ensure_compute_backend_capacity(
     }
     for (const auto& entry : workspace_reclaimers_) {
         if (entry.first != request.owner_id) {
-            entry.second();
+            entry.second(compute_backend);
             if (fits()) {
                 return true;
             }

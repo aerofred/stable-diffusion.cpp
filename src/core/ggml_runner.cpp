@@ -461,6 +461,7 @@ bool GGMLRunner::assign_graph_cut_layer_split_backends(ggml_cgraph* gf,
                                              max_graph_vram_bytes,
                                              graph_cut_layer_split_assignments_,
                                              canonicalize_param,
+                                             graph_cut_layer_split_policy_,
                                              &assignment)) {
         return false;
     }
@@ -491,8 +492,11 @@ bool GGMLRunner::runner_start() {
     cache_.clear();
     workspace_.set_extra_backends(extra_runtime_backends);
     if (auto manager = residency_manager.lock()) {
-        manager->set_workspace_reclaimer(reinterpret_cast<uintptr_t>(this), [this]() {
-            if (!workspace_.release()) {
+        manager->set_workspace_reclaimer(reinterpret_cast<uintptr_t>(this), [this](ggml_backend_t backend) {
+            const bool uses_device = backend == nullptr || backend == runtime_backend ||
+                                     std::find(extra_runtime_backends.begin(), extra_runtime_backends.end(), backend) !=
+                                         extra_runtime_backends.end();
+            if (!uses_device || !workspace_.release()) {
                 return false;
             }
             sync_runtime_residency();
@@ -708,6 +712,13 @@ void GGMLRunner::set_graph_cut_layer_split_backend_vram_limits(const std::vector
     graph_cut_layer_split_assignments_.clear();
     graph_cut_layer_split_node_assignments_.clear();
     graph_cut_layer_split_primary_notice_logged_ = false;
+    invalidate_layer_split_cache();
+}
+
+void GGMLRunner::set_graph_cut_layer_split_policy(const sd::LayerSplitPolicy& policy) {
+    graph_cut_layer_split_policy_ = policy;
+    graph_cut_layer_split_assignments_.clear();
+    graph_cut_layer_split_node_assignments_.clear();
     invalidate_layer_split_cache();
 }
 

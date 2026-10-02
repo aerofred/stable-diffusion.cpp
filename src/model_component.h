@@ -5,6 +5,7 @@ enum class ModelComponent {
     Conditioner,
     Diffusion,
     HighNoiseDiffusion,
+    CFGDiffusion,
     CLIPVision,
     IPAdapter,
     VAE,
@@ -29,6 +30,8 @@ inline const char* model_component_name(ModelComponent component) {
             return "Diffusion model";
         case ModelComponent::HighNoiseDiffusion:
             return "High noise diffusion model";
+        case ModelComponent::CFGDiffusion:
+            return "CFG diffusion model";
         case ModelComponent::CLIPVision:
             return "CLIP vision";
         case ModelComponent::IPAdapter:

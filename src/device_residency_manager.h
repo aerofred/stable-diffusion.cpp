@@ -39,10 +39,13 @@ struct DeviceMemoryRequest {
 struct DeviceResidencyManager {
     virtual ~DeviceResidencyManager() = default;
 
-    virtual bool segmented_compute_enabled() const                                          = 0;
-    virtual bool prefetch_enabled() const                                                   = 0;
-    virtual void set_workspace_reclaimer(uintptr_t owner_id, std::function<bool()> reclaim) = 0;
-    virtual void remove_runtime_owner(uintptr_t owner_id)                                   = 0;
+    virtual bool segmented_compute_enabled() const = 0;
+    virtual bool prefetch_enabled() const          = 0;
+    // The reclaimer receives the device under pressure and returns false when
+    // the owner holds nothing there; runners on other devices may be computing
+    // concurrently and must not be touched.
+    virtual void set_workspace_reclaimer(uintptr_t owner_id, std::function<bool(ggml_backend_t)> reclaim) = 0;
+    virtual void remove_runtime_owner(uintptr_t owner_id)                                                 = 0;
     // Capacity requests select their backend's weights; protection spans all backends.
     virtual bool fits_compute_backend_capacity(const DeviceMemoryRequest& request,
                                                const std::vector<ggml_tensor*>& required_params) const = 0;

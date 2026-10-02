@@ -24,6 +24,32 @@ namespace sd {
         bool has_new_param_assignment = false;
     };
 
+    // How layer split places block segments on the listed devices.
+    //  AUTO:   per-segment cost model (measured matmul throughput, host-to-device
+    //          bandwidth, residual-stream hops); a block is streamed from RAM on
+    //          a fast device when that beats running it resident on a slow one.
+    //  VRAM:   fill each device by its free memory in order (legacy behavior).
+    //  MANUAL: fixed per-device fractions of the parameter-bearing segments.
+    struct LayerSplitPolicy {
+        enum class Mode {
+            AUTO,
+            VRAM,
+            MANUAL,
+        };
+        Mode mode = Mode::AUTO;
+        std::vector<float> ratios;
+    };
+
+    struct LayerSplitDeviceProfile {
+        double gflops   = 0.0;
+        double h2d_gbps = 0.0;
+        bool valid      = false;
+    };
+
+    bool parse_layer_split_policy(const std::string& spec, LayerSplitPolicy* policy, std::string* error);
+    // Measured once per device with a short matmul and pinned upload benchmark.
+    LayerSplitDeviceProfile layer_split_device_profile(ggml_backend_t backend);
+
     std::string layer_split_backend_device_display_name(ggml_backend_t backend);
     int layer_split_tensor_block_index(const std::string& name);
     bool partition_graph_cut_layer_split(const char* desc,
@@ -34,6 +60,7 @@ namespace sd {
                                          size_t primary_backend_vram_limit,
                                          std::unordered_map<const ggml_tensor*, ggml_backend_t>& param_assignments,
                                          const std::function<ggml_tensor*(ggml_tensor*)>& canonical_param_tensor,
+                                         const LayerSplitPolicy& policy,
                                          GraphCutLayerSplitAssignment* assignment_out);
     void log_graph_cut_layer_split_assignment(const char* desc,
                                               const std::vector<ggml_backend_t>& split_backends,

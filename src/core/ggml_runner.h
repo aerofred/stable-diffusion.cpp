@@ -14,6 +14,7 @@
 
 #include "core/compute_workspace.h"
 #include "core/ggml_graph_cut.h"
+#include "core/layer_split_partition.h"
 #include "core/runner_cache.h"
 #include "core/tensor_ggml.hpp"
 #include "core/util.h"
@@ -188,6 +189,7 @@ protected:
     size_t max_graph_vram_bytes        = 0;
     bool graph_cut_layer_split_enabled = false;
     std::vector<size_t> graph_cut_layer_split_backend_vram_limits_;
+    sd::LayerSplitPolicy graph_cut_layer_split_policy_;
 
     std::vector<ggml_backend_t> extra_runtime_backends;  // borrowed (SDBackendManager-owned)
     bool multi_device_eval_callback_warned = false;
@@ -415,6 +417,8 @@ public:
     void set_graph_cut_layer_split_enabled(bool enabled);
 
     void set_graph_cut_layer_split_backend_vram_limits(const std::vector<size_t>& limits);
+
+    void set_graph_cut_layer_split_policy(const sd::LayerSplitPolicy& policy);
 
     void set_runtime_backends(const std::vector<ggml_backend_t>& backends);
 };

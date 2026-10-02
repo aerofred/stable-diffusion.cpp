@@ -105,6 +105,47 @@ device individually. Splitting a module across two GPUs therefore does not raise
 the maximum resolution or frame count; it lets more of a large model stay
 resident instead of being re-staged from RAM at every step.
 
+### Placement policy (`--split-ratio`)
+
+`--split-ratio` chooses how a layer split places blocks on the listed devices:
+
+- `auto` (default): on the first split graph each device is benchmarked once
+  (an f16 matmul and a pinned host-to-device upload, about 100 ms per device).
+  Each block then goes where its estimated cost is lowest: compute time on the
+  device, plus the weight transfer when the block does not fit resident, plus
+  the residual-stream copy when the block changes device. A block is streamed
+  from RAM on a fast device whenever that beats running it resident on a slower
+  one, so a GPU on a narrow PCIe link only receives blocks it can keep resident
+  and only when that is faster than streaming. The log prints the measured
+  profile and the resulting placement with its estimated time per graph.
+- `vram`: fill each device by free memory in `--backend` order (previous behavior).
+- `r0,r1,...`: fixed fractions of the parameter-bearing blocks per device, in
+  `--backend` order, e.g. `--split-ratio 0.7,0.3`.
+
+```shell
+sd-cli -m model.safetensors -p "a cat" --backend "diffusion=cuda0&cuda1" --split-ratio 0.7,0.3
+```
+
+### Parallel classifier-free guidance (`--backend cfg=<device>`)
+
+With `cfg=<device>`, a second copy of the diffusion model is built on that GPU
+and runs the unconditional pass of every sampling step concurrently with the
+conditional pass on the diffusion device:
+
+```shell
+sd-cli -m model.safetensors -p "a cat" --cfg-scale 3.5 --backend diffusion=cuda0,cfg=cuda1
+```
+
+Both devices hold or stream their own copy of the weights (with
+`--offload-to-cpu` this also doubles the diffusion model's RAM copy), so the
+step time becomes the slower of the two passes instead of their sum. This only
+helps when the model fits resident on both devices, or streams fast enough on
+both. The replica follows the `diffusion` params backend and LoRA settings. The
+sequential path is kept when there is no unconditional pass (`--cfg-scale 1`),
+for the high-noise model of two-stage models, with ControlNet, with step
+caches (EasyCache and friends), with generation extensions such as PhotoMaker,
+and when `cfg` names the diffusion device itself.
+
 Use `--list-devices` to see the device names available on the system.
 
 ### Row split (`--split-mode row`)

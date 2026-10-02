@@ -7,6 +7,7 @@
 #include <list>
 #include <mutex>
 #include <set>
+#include <thread>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -141,7 +142,7 @@ StableDiffusionGGML::~StableDiffusionGGML() = default;
 
 const std::map<StableDiffusionGGML::RunnerGroup, std::set<ModelComponent>>& StableDiffusionGGML::runner_components() {
     static const std::map<RunnerGroup, std::set<ModelComponent>> components{
-        {RunnerGroup::Core, {ModelComponent::Conditioner, ModelComponent::Diffusion, ModelComponent::HighNoiseDiffusion, ModelComponent::CLIPVision, ModelComponent::IPAdapter, ModelComponent::AudioEncoder}},
+        {RunnerGroup::Core, {ModelComponent::Conditioner, ModelComponent::Diffusion, ModelComponent::HighNoiseDiffusion, ModelComponent::CFGDiffusion, ModelComponent::CLIPVision, ModelComponent::IPAdapter, ModelComponent::AudioEncoder}},
         {RunnerGroup::VAE, {ModelComponent::VAE, ModelComponent::PreviewVAE, ModelComponent::AudioVAE}},
         {RunnerGroup::ControlNet, {ModelComponent::ControlNet}},
         {RunnerGroup::Extensions, {ModelComponent::PhotoMaker, ModelComponent::PuLID}},
@@ -184,6 +185,8 @@ void StableDiffusionGGML::end_runners() {
         diffusion_model->runner_end();
     if (high_noise_diffusion_model)
         high_noise_diffusion_model->runner_end();
+    if (cfg_diffusion_model)
+        cfg_diffusion_model->runner_end();
     if (clip_vision)
         clip_vision->runner_end();
     if (ip_adapter)
@@ -220,6 +223,7 @@ bool StableDiffusionGGML::reset_runners(const RunnerGroups& groups) {
                 cond_stage_model.reset();
                 diffusion_model.reset();
                 high_noise_diffusion_model.reset();
+                cfg_diffusion_model.reset();
                 clip_vision.reset();
                 ip_adapter.reset();
                 ip_adapter_tokens        = {};
@@ -547,6 +551,13 @@ bool StableDiffusionGGML::register_layer_split_runner_params(ModelComponent comp
 
     model->set_runtime_backends(module_backends);
     model->set_graph_cut_layer_split_backend_vram_limits(layer_split_vram_limits_for_backends(module_backends));
+    sd::LayerSplitPolicy split_policy;
+    std::string split_policy_error;
+    if (!sd::parse_layer_split_policy(split_ratio_spec, &split_policy, &split_policy_error)) {
+        LOG_ERROR("invalid --split-ratio '%s': %s", split_ratio_spec.c_str(), split_policy_error.c_str());
+        return false;
+    }
+    model->set_graph_cut_layer_split_policy(split_policy);
     model->set_graph_cut_layer_split_enabled(true);
     const bool params_follow_runtime = backend_manager.params_backend_follows_runtime(module) ||
                                        backend_manager.params_backend_is_disk(module);
@@ -893,6 +904,9 @@ bool StableDiffusionGGML::set_sage_attention_enabled(bool enabled) {
     if (high_noise_diffusion_model) {
         high_noise_diffusion_model->set_sage_attention_enabled(enabled);
     }
+    if (cfg_diffusion_model) {
+        cfg_diffusion_model->set_sage_attention_enabled(enabled);
+    }
     if (enabled) {
         LOG_INFO("Using SageAttention in the diffusion model; CUDA selects the supported kernel, unsupported layers use flash/default attention");
     }
@@ -926,6 +940,7 @@ bool StableDiffusionGGML::init(const sd_ctx_params_t* sd_ctx_params) {
     backend_spec              = SAFE_STR(sd_ctx_params->backend);
     params_backend_spec       = SAFE_STR(sd_ctx_params->params_backend);
     split_mode_spec           = SAFE_STR(sd_ctx_params->split_mode);
+    split_ratio_spec          = SAFE_STR(sd_ctx_params->split_ratio);
     auto_fit_enabled          = sd_ctx_params->auto_fit && params_backend_spec.empty();
     max_vram_assignment.reset(0.f);
     {
@@ -1092,7 +1107,40 @@ bool StableDiffusionGGML::build_core_runners() {
            register_runner_params(ModelComponent::HighNoiseDiffusion, high_noise_diffusion_model, SDBackendModule::DIFFUSION) &&
            register_runner_params(ModelComponent::CLIPVision, clip_vision, SDBackendModule::CLIP_VISION) &&
            register_runner_params(ModelComponent::IPAdapter, ip_adapter, SDBackendModule::DIFFUSION) &&
-           register_runner_params(ModelComponent::AudioEncoder, audio_encoder, SDBackendModule::AUDIO_ENCODER);
+           register_runner_params(ModelComponent::AudioEncoder, audio_encoder, SDBackendModule::AUDIO_ENCODER) &&
+           build_cfg_diffusion_runner();
+}
+
+bool StableDiffusionGGML::build_cfg_diffusion_runner() {
+    cfg_diffusion_model.reset();
+    if (!backend_manager.has_runtime_assignment(SDBackendModule::CFG)) {
+        return true;
+    }
+    if (!ensure_backend_pair(SDBackendModule::CFG)) {
+        return false;
+    }
+    ggml_backend_t cfg_backend = backend_for(SDBackendModule::CFG);
+    if (sd_backend_is_cpu(cfg_backend) ||
+        ggml_backend_get_device(cfg_backend) == ggml_backend_get_device(backend_for(SDBackendModule::DIFFUSION))) {
+        LOG_WARN("--backend cfg=... must name a GPU other than the diffusion device; running CFG passes sequentially");
+        return true;
+    }
+    if (backend_manager.runtime_backends(SDBackendModule::CFG).size() > 1) {
+        LOG_WARN("the cfg module runs on a single device; using %s",
+                 sd::layer_split_backend_device_display_name(cfg_backend).c_str());
+    }
+    sd::model_builders::Context context = model_build_context();
+    context.diffusion_backend_override  = cfg_backend;
+    sd::model_builders::CoreRunners runners;
+    if (!sd::model_builders::build_core_runners(context, runners) || runners.diffusion == nullptr) {
+        LOG_ERROR("failed to build the CFG diffusion replica");
+        return false;
+    }
+    cfg_diffusion_model = std::move(runners.diffusion);
+    cfg_diffusion_model->set_max_graph_vram_bytes(max_graph_vram_bytes_for_module(SDBackendModule::CFG));
+    LOG_INFO("unconditional CFG pass runs on %s with a second copy of the diffusion weights",
+             sd::layer_split_backend_device_display_name(cfg_backend).c_str());
+    return register_runner_params(ModelComponent::CFGDiffusion, cfg_diffusion_model, SDBackendModule::CFG);
 }
 
 bool StableDiffusionGGML::build_vae_runners() {
@@ -1175,6 +1223,9 @@ bool StableDiffusionGGML::validate_and_load_runners() {
         diffusion_model->set_flash_attention_enabled(true);
         if (high_noise_diffusion_model) {
             high_noise_diffusion_model->set_flash_attention_enabled(true);
+        }
+        if (cfg_diffusion_model) {
+            cfg_diffusion_model->set_flash_attention_enabled(true);
         }
     }
     if (sd_ctx_params->sage_attn && !set_sage_attention_enabled(true)) {
@@ -1598,6 +1649,9 @@ void StableDiffusionGGML::clear_lora_adapters() {
     if (high_noise_diffusion_model) {
         high_noise_diffusion_model->set_weight_adapter(nullptr);
     }
+    if (cfg_diffusion_model) {
+        cfg_diffusion_model->set_weight_adapter(nullptr);
+    }
     if (first_stage_model) {
         first_stage_model->set_weight_adapter(nullptr);
     }
@@ -1708,6 +1762,9 @@ bool StableDiffusionGGML::apply_loras_at_runtime(const std::vector<ModelManager:
             diffusion_model->set_weight_adapter(multi_lora_adapter);
             if (high_noise_diffusion_model) {
                 high_noise_diffusion_model->set_weight_adapter(multi_lora_adapter);
+            }
+            if (cfg_diffusion_model) {
+                cfg_diffusion_model->set_weight_adapter(multi_lora_adapter);
             }
         }
     }
@@ -2217,6 +2274,7 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
         }
     };
     RunnerEndOnExit sample_diffusion_runner_end{work_diffusion_model.get()};
+    RunnerEndOnExit sample_cfg_runner_end{cfg_diffusion_model.get()};
 
     RunnerEndOnExit sample_control_runner_end{!control_image.empty() && control_net != nullptr ? control_net.get() : nullptr};
 
@@ -2380,10 +2438,10 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
         sd::Tensor<float> img_uncond_out;
         sd_sample::SampleStepCacheDispatcher step_cache(cache_runtime, step, sigma);
         std::vector<sd::Tensor<float>> controls;
-        DiffusionParams diffusion_params;
-        diffusion_params.x                = &noised_input;
-        diffusion_params.timesteps        = &timesteps_tensor;
-        diffusion_params.ref_image_params = ref_image_params;
+        DiffusionParams base_diffusion_params;
+        base_diffusion_params.x                = &noised_input;
+        base_diffusion_params.timesteps        = &timesteps_tensor;
+        base_diffusion_params.ref_image_params = ref_image_params;
         sd::guidance::GuidanceInput step_guidance_input;
         step_guidance_input.step          = step;
         step_guidance_input.schedule_size = sigmas.size();
@@ -2400,15 +2458,19 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
                                           !ref_latents.empty() &&
                                           sd_version_supports_ref_latent_img_cfg(version);
 
-        auto run_condition = [&](const SDCondition& condition,
+        // Each pass works on its own copy of the parameters so two passes can
+        // run concurrently on different devices.
+        auto run_condition = [&](const std::shared_ptr<DiffusionModelRunner>& model,
+                                 const SDCondition& condition,
                                  const sd::Tensor<float>* c_concat_override                 = nullptr,
                                  const std::vector<int>* local_skip_layers                  = nullptr,
                                  const std::vector<sd::Tensor<float>>* ref_latents_override = nullptr,
                                  bool use_uncond_ip                                         = false) -> sd::Tensor<float> {
-            diffusion_params.context     = condition.c_crossattn.empty() ? nullptr : &condition.c_crossattn;
-            diffusion_params.c_concat    = c_concat_override != nullptr ? c_concat_override : (condition.c_concat.empty() ? nullptr : &condition.c_concat);
-            diffusion_params.y           = condition.c_vector.empty() ? nullptr : &condition.c_vector;
-            diffusion_params.ref_latents = ref_latents_override != nullptr ? ref_latents_override : (condition.c_ref_images.empty() ? &ref_latents : &condition.c_ref_images);
+            DiffusionParams diffusion_params = base_diffusion_params;
+            diffusion_params.context         = condition.c_crossattn.empty() ? nullptr : &condition.c_crossattn;
+            diffusion_params.c_concat        = c_concat_override != nullptr ? c_concat_override : (condition.c_concat.empty() ? nullptr : &condition.c_concat);
+            diffusion_params.y               = condition.c_vector.empty() ? nullptr : &condition.c_vector;
+            diffusion_params.ref_latents     = ref_latents_override != nullptr ? ref_latents_override : (condition.c_ref_images.empty() ? &ref_latents : &condition.c_ref_images);
 
             if (sd_version_is_unet(version)) {
                 int nvf = -1;
@@ -2487,7 +2549,7 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
                 extension->before_diffusion(diffusion_params, step);
             }
 
-            auto output_opt = work_diffusion_model->compute(n_threads, diffusion_params);
+            auto output_opt = model->compute(n_threads, diffusion_params);
             if (output_opt.empty()) {
                 LOG_ERROR("diffusion model compute failed");
                 return sd::Tensor<float>();
@@ -2510,35 +2572,70 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
             }
         }
 
-        cond_out = run_condition(*positive_condition, c_concat_override);
-        if (cond_out.empty()) {
-            return {};
+        const std::vector<int>* uncond_skip_layers = nullptr;
+        if (!uncond.empty() && is_skiplayer_step && slg_uncond) {
+            LOG_VERBOSE("Skipping layers at uncond step %d\n", step);
+            uncond_skip_layers = &skip_layer_guidance.layers();
         }
-
-        if (!uncond.empty()) {
-            if (!step_cache.is_step_skipped()) {
-                compute_sample_controls(control_image,
-                                        noised_input,
-                                        timesteps_tensor,
-                                        uncond,
-                                        &controls);
-            }
-            const std::vector<int>* uncond_skip_layers = nullptr;
-            if (is_skiplayer_step && slg_uncond) {
-                LOG_VERBOSE("Skipping layers at uncond step %d\n", step);
-                uncond_skip_layers = &skip_layer_guidance.layers();
-            }
-            uncond_out = run_condition(uncond,
-                                       uncond.c_concat.empty() ? nullptr : &uncond.c_concat,
-                                       uncond_skip_layers,
-                                       nullptr,
-                                       true);
-            if (uncond_out.empty()) {
+        // The replica runs the unconditional pass on its own device while the
+        // main device runs the conditional one. Features that share per-step
+        // state between the two passes keep the sequential path.
+        const bool parallel_cfg = cfg_diffusion_model != nullptr &&
+                                  work_diffusion_model == diffusion_model &&
+                                  !uncond.empty() &&
+                                  cache_runtime.mode == sd_sample::SampleCacheMode::NONE &&
+                                  generation_extensions.empty() &&
+                                  (control_image.empty() || control_net == nullptr) &&
+                                  sd_get_backend_eval_callback() == nullptr;
+        if (parallel_cfg) {
+            sd::Tensor<float> parallel_uncond_out;
+            std::thread uncond_thread([&]() {
+                try {
+                    parallel_uncond_out = run_condition(cfg_diffusion_model,
+                                                        uncond,
+                                                        uncond.c_concat.empty() ? nullptr : &uncond.c_concat,
+                                                        uncond_skip_layers,
+                                                        nullptr,
+                                                        true);
+                } catch (const std::exception& error) {
+                    LOG_ERROR("unconditional pass failed on the CFG device: %s", error.what());
+                    parallel_uncond_out = sd::Tensor<float>();
+                }
+            });
+            cond_out = run_condition(work_diffusion_model, *positive_condition, c_concat_override);
+            uncond_thread.join();
+            uncond_out = std::move(parallel_uncond_out);
+            if (cond_out.empty() || uncond_out.empty()) {
                 return {};
+            }
+        } else {
+            cond_out = run_condition(work_diffusion_model, *positive_condition, c_concat_override);
+            if (cond_out.empty()) {
+                return {};
+            }
+
+            if (!uncond.empty()) {
+                if (!step_cache.is_step_skipped()) {
+                    compute_sample_controls(control_image,
+                                            noised_input,
+                                            timesteps_tensor,
+                                            uncond,
+                                            &controls);
+                }
+                uncond_out = run_condition(work_diffusion_model,
+                                           uncond,
+                                           uncond.c_concat.empty() ? nullptr : &uncond.c_concat,
+                                           uncond_skip_layers,
+                                           nullptr,
+                                           true);
+                if (uncond_out.empty()) {
+                    return {};
+                }
             }
         }
         if (!img_uncond.empty()) {
-            img_uncond_out = run_condition(img_uncond,
+            img_uncond_out = run_condition(work_diffusion_model,
+                                           img_uncond,
                                            img_uncond.c_concat.empty() ? nullptr : &img_uncond.c_concat,
                                            nullptr,
                                            uncond_without_ref_latents ? &empty_ref_latents : nullptr,
@@ -2563,7 +2660,8 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
             LOG_VERBOSE("Skipping layers at step %d\n", step);
             if (!step_cache.is_step_skipped()) {
                 guidance_input.predict_skip_layer = [&]() -> sd::Tensor<float> {
-                    return run_condition(cond,
+                    return run_condition(work_diffusion_model,
+                                         cond,
                                          cond.c_concat.empty() ? nullptr : &cond.c_concat,
                                          &skip_layer_guidance.layers());
                 };
@@ -2946,6 +3044,9 @@ void StableDiffusionGGML::apply_circular_axes(bool circular_x, bool circular_y) 
     this->circular_y = circular_y;
     if (this->diffusion_model) {
         this->diffusion_model->set_circular_axes(circular_x, circular_y);
+    }
+    if (this->cfg_diffusion_model) {
+        this->cfg_diffusion_model->set_circular_axes(circular_x, circular_y);
     }
     if (this->high_noise_diffusion_model) {
         this->high_noise_diffusion_model->set_circular_axes(circular_x, circular_y);

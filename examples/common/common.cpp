@@ -538,7 +538,9 @@ ArgOptions SDContextParams::get_options() {
          &esrgan_path},
         {"",
          "--backend",
-         "runtime backend assignment, e.g. cpu or clip=cpu,vae=cuda0,diffusion=vulkan0",
+         "runtime backend assignment, e.g. cpu or clip=cpu,vae=cuda0,diffusion=vulkan0. "
+         "cfg=<device> runs the unconditional CFG pass on a second GPU with its own copy of the diffusion weights, "
+         "concurrently with the conditional pass",
          (int)',',
          &backend},
         {"",
@@ -553,6 +555,14 @@ ArgOptions SDContextParams::get_options() {
          "Accepts a single mode or per-module assignments, e.g. row or diffusion=row,te=layer",
          (int)',',
          &split_mode},
+        {"",
+         "--split-ratio",
+         "layer split placement for modules assigned multiple devices: auto (default; measures each device's matmul "
+         "throughput and host-to-device bandwidth and places each block where it costs the least, streaming from RAM "
+         "when that is faster than a slower device), vram (fill each device by free memory, previous behavior), "
+         "or per-device block fractions in --backend order, e.g. 0.7,0.3",
+         0,
+         &split_ratio},
         {"",
          "--rpc-servers",
          "comma-separated list of RPC servers to connect to for offloading, in the format host:port, e.g. localhost:50052,192.168.1.3:50052",
@@ -934,6 +944,7 @@ std::string SDContextParams::to_string() const {
         << "  backend: \"" << backend << "\",\n"
         << "  params_backend: \"" << params_backend << "\",\n"
         << "  split_mode: \"" << split_mode << "\",\n"
+        << "  split_ratio: \"" << split_ratio << "\",\n"
         << "  model_args: \"" << model_args << "\",\n"
         << "  auto_fit: " << (auto_fit ? "true" : "false") << ",\n"
         << "  enable_mmap: " << (enable_mmap ? "true" : "false") << ",\n"
@@ -1015,6 +1026,7 @@ sd_ctx_params_t SDContextParams::to_sd_ctx_params_t(bool taesd_preview) {
     sd_ctx_params.backend                         = effective_backend.c_str();
     sd_ctx_params.params_backend                  = effective_params_backend.c_str();
     sd_ctx_params.split_mode                      = split_mode.c_str();
+    sd_ctx_params.split_ratio                     = split_ratio.c_str();
     sd_ctx_params.auto_fit                        = auto_fit;
     sd_ctx_params.rpc_servers                     = rpc_servers.c_str();
     sd_ctx_params.model_args                      = model_args.empty() ? nullptr : model_args.c_str();

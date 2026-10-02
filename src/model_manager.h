@@ -5,6 +5,7 @@
 #include <list>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <unordered_set>
@@ -111,7 +112,9 @@ private:
     std::map<uintptr_t, std::unique_ptr<PrefetchBlock>> prefetch_blocks_;
     std::map<ggml_backend_t, ggml_backend_t> prefetch_backends_;
     std::map<std::pair<uintptr_t, ggml_backend_t>, RuntimeResidency> runtime_residencies_;
-    std::map<uintptr_t, std::function<bool()>> workspace_reclaimers_;
+    std::map<uintptr_t, std::function<bool(ggml_backend_t)>> workspace_reclaimers_;
+    // Runners on different devices call in concurrently (parallel CFG passes).
+    mutable std::recursive_mutex mutex_;
     bool warned_split_lora_skip_ = false;
     std::set<std::string> common_ignore_tensors_;
     std::vector<LoraSpec> loras_;
@@ -286,7 +289,7 @@ public:
     bool assign_compute_backend(const std::vector<ggml_tensor*>& tensors,
                                 ggml_backend_t compute_backend) override;
     bool prepare_params(const std::vector<ggml_tensor*>& tensors) override;
-    void set_workspace_reclaimer(uintptr_t owner_id, std::function<bool()> reclaim) override;
+    void set_workspace_reclaimer(uintptr_t owner_id, std::function<bool(ggml_backend_t)> reclaim) override;
     void remove_runtime_owner(uintptr_t owner_id) override;
     bool fits_compute_backend_capacity(const DeviceMemoryRequest& request,
                                        const std::vector<ggml_tensor*>& required_params) const override;

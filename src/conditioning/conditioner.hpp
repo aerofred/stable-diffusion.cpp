@@ -9,6 +9,7 @@
 #include <sstream>
 #include <stdexcept>
 #include "core/ggml_tensor_utils.h"
+#include "core/layer_split_partition.h"
 
 #include "core/tensor_ggml.hpp"
 #include "core/util.h"
@@ -152,6 +153,7 @@ public:
     virtual void set_runtime_backends(const std::vector<ggml_backend_t>& backends) {}
     virtual void set_graph_cut_layer_split_enabled(bool enabled) {}
     virtual void set_graph_cut_layer_split_backend_vram_limits(const std::vector<size_t>& limits) {}
+    virtual void set_graph_cut_layer_split_policy(const sd::LayerSplitPolicy& policy) {}
     virtual void get_layer_split_param_tensors(std::map<std::string, ggml_tensor*>& tensors) {}
     virtual void set_flash_attention_enabled(bool enabled) = 0;
     virtual void set_scale_overrides(float linear_scale, float attn_scale) {}
@@ -233,6 +235,13 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
         text_model->set_graph_cut_layer_split_backend_vram_limits(limits);
         if (sd_version_is_sdxl(version)) {
             text_model2->set_graph_cut_layer_split_backend_vram_limits(limits);
+        }
+    }
+
+    void set_graph_cut_layer_split_policy(const sd::LayerSplitPolicy& policy) override {
+        text_model->set_graph_cut_layer_split_policy(policy);
+        if (sd_version_is_sdxl(version)) {
+            text_model2->set_graph_cut_layer_split_policy(policy);
         }
     }
 
@@ -750,6 +759,18 @@ struct SD3CLIPEmbedder : public Conditioner {
         }
     }
 
+    void set_graph_cut_layer_split_policy(const sd::LayerSplitPolicy& policy) override {
+        if (clip_l) {
+            clip_l->set_graph_cut_layer_split_policy(policy);
+        }
+        if (clip_g) {
+            clip_g->set_graph_cut_layer_split_policy(policy);
+        }
+        if (t5) {
+            t5->set_graph_cut_layer_split_policy(policy);
+        }
+    }
+
     void get_layer_split_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
         if (t5) {
             t5->get_param_tensors(tensors, "text_encoders.t5xxl.transformer");
@@ -1153,6 +1174,15 @@ struct FluxCLIPEmbedder : public Conditioner {
         }
     }
 
+    void set_graph_cut_layer_split_policy(const sd::LayerSplitPolicy& policy) override {
+        if (clip_l) {
+            clip_l->set_graph_cut_layer_split_policy(policy);
+        }
+        if (t5) {
+            t5->set_graph_cut_layer_split_policy(policy);
+        }
+    }
+
     void get_layer_split_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
         if (t5) {
             t5->get_param_tensors(tensors, "text_encoders.t5xxl.transformer");
@@ -1442,6 +1472,12 @@ struct T5CLIPEmbedder : public Conditioner {
         }
     }
 
+    void set_graph_cut_layer_split_policy(const sd::LayerSplitPolicy& policy) override {
+        if (t5) {
+            t5->set_graph_cut_layer_split_policy(policy);
+        }
+    }
+
     void get_layer_split_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
         if (t5) {
             t5->get_param_tensors(tensors, "text_encoders.t5xxl.transformer");
@@ -1662,6 +1698,12 @@ struct MiniT2IConditioner : public Conditioner {
         }
     }
 
+    void set_graph_cut_layer_split_policy(const sd::LayerSplitPolicy& policy) override {
+        if (t5) {
+            t5->set_graph_cut_layer_split_policy(policy);
+        }
+    }
+
     void get_layer_split_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
         if (t5) {
             t5->get_param_tensors(tensors, "text_encoders.t5xxl.transformer");
@@ -1808,11 +1850,11 @@ struct AnimaConditioner : public Conditioner {
                      std::shared_ptr<RunnerWeightManager> weight_manager = nullptr,
                      const TokenizerConfig& tokenizers                   = {}) {
         llm            = std::make_shared<LLM::LLMRunner>(LLM::LLMArch::QWEN3,
-                                               backend,
-                                               tensor_storage_map,
-                                               "text_encoders.llm",
-                                               false,
-                                               weight_manager);
+                                                          backend,
+                                                          tensor_storage_map,
+                                                          "text_encoders.llm",
+                                                          false,
+                                                          weight_manager);
         qwen_tokenizer = tokenizers.create(TokenizerConfig::MAIN, llm->config.vocab_size, 151643);
         if (!qwen_tokenizer) {
             qwen_tokenizer = std::make_shared<Qwen2Tokenizer>();
@@ -1841,6 +1883,10 @@ struct AnimaConditioner : public Conditioner {
 
     void set_graph_cut_layer_split_backend_vram_limits(const std::vector<size_t>& limits) override {
         llm->set_graph_cut_layer_split_backend_vram_limits(limits);
+    }
+
+    void set_graph_cut_layer_split_policy(const sd::LayerSplitPolicy& policy) override {
+        llm->set_graph_cut_layer_split_policy(policy);
     }
 
     void get_layer_split_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
@@ -1997,11 +2043,11 @@ struct LLMEmbedder : public Conditioner {
             arch = LLM::LLMArch::QWEN3;
         }
         llm        = std::make_shared<LLM::LLMRunner>(arch,
-                                               backend,
-                                               tensor_storage_map,
-                                               "text_encoders.llm",
-                                               enable_vision,
-                                               weight_manager);
+                                                      backend,
+                                                      tensor_storage_map,
+                                                      "text_encoders.llm",
+                                                      enable_vision,
+                                                      weight_manager);
         int pad_id = 151643;
         if (arch == LLM::LLMArch::MISTRAL_SMALL_3_2 || arch == LLM::LLMArch::MINISTRAL_3_3B) {
             pad_id = 11;
@@ -2073,6 +2119,15 @@ struct LLMEmbedder : public Conditioner {
         }
         if (byt5) {
             byt5->set_graph_cut_layer_split_backend_vram_limits(limits);
+        }
+    }
+
+    void set_graph_cut_layer_split_policy(const sd::LayerSplitPolicy& policy) override {
+        if (llm) {
+            llm->set_graph_cut_layer_split_policy(policy);
+        }
+        if (byt5) {
+            byt5->set_graph_cut_layer_split_policy(policy);
         }
     }
 
@@ -3184,7 +3239,7 @@ struct LLMEmbedder : public Conditioner {
             for (const auto& [index, image_embed] : image_embeds) {
                 int64_t begin = std::max<int64_t>(0, index - 1);
                 int64_t end   = std::min<int64_t>(static_cast<int64_t>(tags.size()),
-                                                index + image_embed.shape()[1] + 1);
+                                                  index + image_embed.shape()[1] + 1);
                 std::fill(tags.begin() + begin, tags.begin() + end, 0);
             }
             int64_t tag_count    = static_cast<int64_t>(tags.size());
@@ -3312,9 +3367,9 @@ struct LLaDAImageEmbedder : public Conditioner {
         // <|endoftext|> doubles as the pad token in LLaDA2's tokenizer.json.
         tokenizer       = tokenizers.create(TokenizerConfig::MAIN, llm->config.vocab_size, 156892);
         query_former    = std::make_shared<LLaDAImageTE::QueryFormerRunner>(backend,
-                                                                         tensor_storage_map,
-                                                                         query_former_prefix,
-                                                                         weight_manager);
+                                                                            tensor_storage_map,
+                                                                            query_former_prefix,
+                                                                            weight_manager);
         text_projection = std::make_shared<LLaDAImageTE::TextProjectionRunner>(backend,
                                                                                tensor_storage_map,
                                                                                text_projection_prefix,
@@ -3373,6 +3428,10 @@ struct LLaDAImageEmbedder : public Conditioner {
 
     void set_graph_cut_layer_split_backend_vram_limits(const std::vector<size_t>& limits) override {
         llm->set_graph_cut_layer_split_backend_vram_limits(limits);
+    }
+
+    void set_graph_cut_layer_split_policy(const sd::LayerSplitPolicy& policy) override {
+        llm->set_graph_cut_layer_split_policy(policy);
     }
 
     void get_layer_split_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
@@ -3518,20 +3577,20 @@ struct LTXAVEmbedder : public Conditioner {
         LLM::LLMArch arch = detect_gemma_arch(tensor_storage_map, llm_prefix);
         LOG_INFO("ltxav text encoder: %s", arch == LLM::LLMArch::GEMMA4_12B ? "gemma 4" : "gemma 3");
         llm       = std::make_shared<LLM::LLMRunner>(arch,
-                                               backend,
-                                               tensor_storage_map,
-                                               llm_prefix,
-                                               false,
-                                               weight_manager);
+                                                     backend,
+                                                     tensor_storage_map,
+                                                     llm_prefix,
+                                                     false,
+                                                     weight_manager);
         tokenizer = tokenizers.create(TokenizerConfig::MAIN, llm->config.vocab_size, 0, true);
         if (!tokenizer) {
             tokenizer = std::make_shared<GemmaTokenizer>();
         }
         dual_projection = tensor_storage_map.find(projector_prefix + ".video_aggregate_embed.weight") != tensor_storage_map.end();
         projector       = std::make_shared<LTXAVTextProjectionRunner>(backend,
-                                                                tensor_storage_map,
-                                                                projector_prefix,
-                                                                weight_manager);
+                                                                      tensor_storage_map,
+                                                                      projector_prefix,
+                                                                      weight_manager);
     }
 
     void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
@@ -3568,6 +3627,10 @@ struct LTXAVEmbedder : public Conditioner {
 
     void set_graph_cut_layer_split_backend_vram_limits(const std::vector<size_t>& limits) override {
         llm->set_graph_cut_layer_split_backend_vram_limits(limits);
+    }
+
+    void set_graph_cut_layer_split_policy(const sd::LayerSplitPolicy& policy) override {
+        llm->set_graph_cut_layer_split_policy(policy);
     }
 
     void get_layer_split_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {

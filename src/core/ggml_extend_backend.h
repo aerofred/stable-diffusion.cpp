@@ -22,6 +22,7 @@ enum class SDBackendModule {
     UPSCALER,
     DETECTOR,
     AUDIO_ENCODER,
+    CFG,  // replica of the diffusion model that runs the unconditional CFG pass concurrently
 };
 
 struct SDBackendAssignment {
@@ -71,6 +72,7 @@ public:
     std::vector<ggml_backend_t> runtime_backends(SDBackendModule module);
 
     SDSplitMode split_mode(SDBackendModule module) const;
+    bool has_runtime_assignment(SDBackendModule module) const;
     ggml_backend_buffer_type_t split_buffer_type(ggml_backend_t backend,
                                                  const std::vector<float>& tensor_split);
 

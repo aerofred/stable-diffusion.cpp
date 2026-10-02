@@ -209,6 +209,7 @@ bool ModelManager::populate_prefetch_block(PrefetchBlock& block) {
 WeightPrefetchResult ModelManager::prefetch_params(
     uintptr_t owner_id,
     const std::vector<ggml_tensor*>& tensors) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (tensors.empty()) {
         return WeightPrefetchResult::AlreadyResident;
     }
@@ -281,6 +282,7 @@ WeightPrefetchResult ModelManager::prefetch_params(
 bool ModelManager::activate_prefetched_params(
     uintptr_t owner_id,
     const std::vector<ggml_tensor*>& tensors) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     std::vector<TensorState*> required_states;
     if (!resolve_required_tensor_states(tensors, required_states)) {
         return false;
@@ -343,6 +345,7 @@ bool ModelManager::activate_prefetched_params(
 }
 
 void ModelManager::clear_prefetched_params(uintptr_t owner_id) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     auto existing = prefetch_blocks_.find(owner_id);
     if (existing == prefetch_blocks_.end()) {
         return;

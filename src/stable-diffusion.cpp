@@ -344,6 +344,7 @@ void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
     sd_ctx_params->backend                   = nullptr;
     sd_ctx_params->params_backend            = nullptr;
     sd_ctx_params->split_mode                = nullptr;
+    sd_ctx_params->split_ratio               = nullptr;
     sd_ctx_params->auto_fit                  = true;
     sd_ctx_params->rpc_servers               = nullptr;
     sd_ctx_params->model_args                = nullptr;
@@ -389,6 +390,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              "backend: %s\n"
              "params_backend: %s\n"
              "split_mode: %s\n"
+             "split_ratio: %s\n"
              "model_args: %s\n"
              "auto_fit: %s\n"
              "flash_attn: %s\n"
@@ -429,6 +431,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              SAFE_STR(sd_ctx_params->backend),
              SAFE_STR(sd_ctx_params->params_backend),
              SAFE_STR(sd_ctx_params->split_mode),
+             SAFE_STR(sd_ctx_params->split_ratio),
              SAFE_STR(sd_ctx_params->model_args),
              BOOL_STR(sd_ctx_params->auto_fit),
              BOOL_STR(sd_ctx_params->flash_attn),
