@@ -22,6 +22,10 @@ namespace sd {
                                                   const std::string& name,
                                                   ggml_tensor* source,
                                                   ggml_status& status);
+        // Copies source into this entry when its tensor already has the same
+        // layout on the target device, so a cut that recurs every graph does
+        // not reallocate its cache buffer.
+        bool refill(ggml_backend_t backend, ggml_tensor* source);
     };
     using CachedTensors = std::map<std::string, std::unique_ptr<CachedTensor>>;
 

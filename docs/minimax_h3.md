@@ -94,3 +94,17 @@ frame rate and optional soundtrack; non-24-fps inputs are resampled internally.
 - MiniMax-H3 runs at 24 fps; another requested value is overridden.
 - The default video flow shift is 12. The audio stream is mapped internally to
   its shift of 3, so the regular samplers can operate on the packed AV latent.
+
+## Performance notes
+
+- Attention is a large share of each step at video token counts. `--sage-attn`
+  (CUDA) runs it with the SageAttention kernel and cuts the step time
+  noticeably; compare the output against `--diffusion-fa` on your prompts.
+- `--cache-mode easycache` (see [caching](./caching.md)) skips steps whose
+  input barely changed; with 20 Euler steps it typically reuses about a third.
+- The feed-forward of each block runs by token ranges on long sequences, which
+  keeps its `3 x ffn` f32 intermediates from scaling with the token count.
+  Ranges are sized automatically (about 256 MiB of temporaries); `--model-args
+  token_chunk=N` forces N tokens per range and `token_chunk=0` disables it.
+- The video VAE decodes in temporal windows; its spatial tile size has little
+  effect on the decode time.

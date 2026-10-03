@@ -21,6 +21,14 @@ namespace sd::ggml_graph_cut {
 
 namespace sd {
     class SegmentWeightPipeline {
+    public:
+        // Time spent by the last segment_start in each of its steps.
+        struct StartTiming {
+            int64_t activate_us = 0;
+            int64_t capacity_us = 0;
+            int64_t prepare_us  = 0;
+        };
+
     private:
         std::weak_ptr<DeviceResidencyManager> residency_manager_;
         ggml_backend_t compute_backend_ = nullptr;
@@ -33,6 +41,7 @@ namespace sd {
         bool queued_cross_step_ = false;
         bool enabled_           = true;
         bool wrap_prefetch_     = false;
+        StartTiming last_start_timing_;
 
         size_t next_parameter_segment(size_t segment_index) const;
         ggml_backend_t segment_backend(size_t segment_index) const;
@@ -64,6 +73,7 @@ namespace sd {
         bool ensure_segment_capacity(size_t segment_index,
                                      const std::vector<DeviceMemoryRequest>& requests);
         bool segment_start(size_t segment_index, const std::function<bool()>& ensure_capacity);
+        const StartTiming& last_start_timing() const { return last_start_timing_; }
         void segment_end();
         // Prefetch is best effort; segment_start falls back to synchronous loading.
         // The request matching the next segment's device is used; with a single

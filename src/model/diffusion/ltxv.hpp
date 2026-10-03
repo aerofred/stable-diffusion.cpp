@@ -16,6 +16,7 @@
 
 #include "model/common/block.hpp"
 #include "model/common/rope.hpp"
+#include "model/diffusion/dit.hpp"
 #include "model/diffusion/flux.hpp"
 #include "model/diffusion/model.hpp"
 #include "model_loader.h"
@@ -45,24 +46,7 @@ namespace LTXV {
         return t;
     }
 
-    // Tokens per range for a stage whose f32 temporaries take bytes_per_token
-    // per token: <0 sizes ranges for about 256 MiB of temporaries, 0 disables
-    // chunking, >0 is an explicit token count.
-    __STATIC_INLINE__ int64_t token_chunk_size(int64_t setting, int64_t bytes_per_token, int64_t n_tokens) {
-        if (setting == 0) {
-            return n_tokens;
-        }
-        if (setting > 0) {
-            return std::min(setting, n_tokens);
-        }
-        // At most 8 ranges per stage: every range adds graph nodes, and
-        // beyond that the saving per extra range is small.
-        constexpr int64_t max_ranges = 8;
-        int64_t tokens               = (int64_t(256) << 20) / std::max<int64_t>(bytes_per_token, 1);
-        tokens                       = std::max<int64_t>(1024, tokens - tokens % 256);
-        tokens                       = std::max<int64_t>(tokens, (n_tokens + max_ranges - 1) / max_ranges);
-        return std::min(tokens, n_tokens);
-    }
+    using DiT::token_chunk_size;
 
     __STATIC_INLINE__ ggml_tensor* align_token_modulation(ggml_context* ctx,
                                                           ggml_tensor* x,
@@ -2013,18 +1997,7 @@ namespace LTXV {
                 if (key != "token_chunk") {
                     continue;
                 }
-                if (value == "auto") {
-                    config.token_chunk = -1;
-                    continue;
-                }
-                char* end        = nullptr;
-                long long parsed = std::strtoll(value.c_str(), &end, 10);
-                if (!value.empty() && end != nullptr && *end == '\0' && parsed >= 0) {
-                    config.token_chunk = parsed;
-                } else {
-                    LOG_WARN("ignoring invalid LTX model arg '%s=%s' (expected auto, 0 or a token count)",
-                             key.c_str(), value.c_str());
-                }
+                config.token_chunk = DiT::parse_token_chunk_arg(value, "LTX", config.token_chunk);
             }
             return config;
         }

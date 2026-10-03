@@ -2244,6 +2244,7 @@ struct LLMEmbedder : public Conditioner {
         auto& mask               = std::get<2>(tokens_weights_mask);
 
         if (tokens.empty()) {
+            LOG_ERROR("prompt tokenized to zero tokens");
             return {};
         }
 
@@ -2500,6 +2501,11 @@ struct LLMEmbedder : public Conditioner {
                 }
             }
             prompt += conditioner_params.text;
+            // No chat template wraps the text, so an empty negative prompt
+            // without references would tokenize to nothing; keep one pad token.
+            if (prompt.empty()) {
+                min_length = 1;
+            }
         } else if (sd_version_is_hunyuan_video(version)) {
             prompt_template_encode_start_idx = 98;
             out_layers                       = {26};

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <limits>
 #include <set>
 #include <string>
 #include <tuple>
@@ -39,9 +40,11 @@ namespace MiniMaxH3 {
         int patch_t                      = 1;
         int patch_h                      = 2;
         int patch_w                      = 2;
-        float norm_eps                   = 1e-5f;
-        float qk_norm_eps                = 1e-5f;
-        float final_norm_eps             = 1e-5f;
+        // Tokens per feed-forward range: <0 automatic, 0 disabled, >0 explicit.
+        int64_t token_chunk  = -1;
+        float norm_eps       = 1e-5f;
+        float qk_norm_eps    = 1e-5f;
+        float final_norm_eps = 1e-5f;
 
         bool uses_adaln_curves() const {
             return adaln_curve_grid > 0;
@@ -139,40 +142,131 @@ namespace MiniMaxH3 {
     };
 
     struct MLP : public UnaryBlock {
+        int64_t ffn_hidden_size;
+        int64_t token_chunk        = -1;
+        bool token_chunk_disabled_ = false;
+
         MLP(int64_t hidden_size,
-            int64_t ffn_hidden_size) {
+            int64_t ffn_hidden_size)
+            : ffn_hidden_size(ffn_hidden_size) {
             blocks["fc1"] = std::make_shared<Linear>(hidden_size, ffn_hidden_size * 2, false, false, true, 1.f / 128.f);
             blocks["fc2"] = std::make_shared<Linear>(ffn_hidden_size, hidden_size, false, false, true, 1.f / 128.f);
         }
 
-        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+        ggml_tensor* feed_forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
             auto fc1 = std::dynamic_pointer_cast<Linear>(blocks["fc1"]);
             auto fc2 = std::dynamic_pointer_cast<Linear>(blocks["fc2"]);
-            auto uv  = ggml_ext_chunk(ctx->ggml_ctx, fc1->forward(ctx, x), 2, 0);
-            return fc2->forward(ctx, ggml_mul(ctx->ggml_ctx,
-                                              ggml_silu(ctx->ggml_ctx, uv[0]),
-                                              uv[1]));
+            auto uv  = fc1->forward(ctx, x);
+            // The fused GLU reads the 2 x ffn intermediate once instead of
+            // copying both halves, applying silu and multiplying separately.
+            auto act = ggml_swiglu(ctx->ggml_ctx, uv);
+            if (!ggml_backend_supports_op(ctx->backend, act)) {
+                auto halves = ggml_ext_chunk(ctx->ggml_ctx, uv, 2, 0);
+                act         = ggml_mul(ctx->ggml_ctx, ggml_silu(ctx->ggml_ctx, halves[0]), halves[1]);
+            }
+            return fc2->forward(ctx, act);
+        }
+
+        // Long sequences run the feed-forward by token ranges so the 3 x ffn
+        // f32 intermediates of one range are released before the next. `x`
+        // must be owned by the caller and dead afterwards: each range's result
+        // is written back over its own tokens with chained in-place sets, and
+        // the final set view is the output.
+        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+            ggml_context* g        = ctx->ggml_ctx;
+            const int64_t n_tokens = x->ne[1];
+            const int64_t chunk    = DiT::token_chunk_size(token_chunk,
+                                                           ffn_hidden_size * 3 * static_cast<int64_t>(sizeof(float)),
+                                                           n_tokens);
+            const bool chunked     = !token_chunk_disabled_ && chunk < n_tokens &&
+                                 x->type == GGML_TYPE_F32 && x->ne[2] == 1 && x->ne[3] == 1 &&
+                                 ggml_is_contiguous(x) &&
+                                 ggml_nbytes(x) <= static_cast<size_t>(std::numeric_limits<int32_t>::max());
+            if (!chunked) {
+                return feed_forward(ctx, x);
+            }
+            ggml_tensor* out = x;
+            for (int64_t start = 0; start < n_tokens; start += chunk) {
+                const int64_t count = std::min(chunk, n_tokens - start);
+                auto x_c            = ggml_view_2d(g, x, x->ne[0], count, x->nb[1], static_cast<size_t>(start) * x->nb[1]);
+                auto y              = feed_forward(ctx, x_c);
+                auto next           = ggml_set_inplace(g, out, y, x->nb[1], x->nb[2], x->nb[3],
+                                                       static_cast<size_t>(start) * x->nb[1]);
+                if (start == 0 && !ggml_backend_supports_op(ctx->backend, next)) {
+                    LOG_WARN("%s does not support GGML_OP_SET; MiniMax-H3 feed-forward token chunking disabled",
+                             ggml_backend_name(ctx->backend));
+                    token_chunk_disabled_ = true;
+                    return feed_forward(ctx, x);
+                }
+                out = next;
+            }
+            return out;
         }
     };
+
+    // Rotates the first 2 * cos->ne[0] channels of x ([d, L, heads], contiguous
+    // and owned by the caller) in place: pairs are (i, i + r) as in the
+    // non-interleaved rope. The two rotated halves are computed from views of
+    // x and written back with chained in-place sets; they are scheduled before
+    // the sets so the reads see the unrotated values. Returns the result view,
+    // or nullptr when the backend or graph cannot run this form.
+    static ggml_tensor* rope_in_place(GGMLRunnerContext* ctx,
+                                      ggml_tensor* x,
+                                      ggml_tensor* cos,
+                                      ggml_tensor* sin) {
+        ggml_context* g = ctx->ggml_ctx;
+        int64_t rot     = cos->ne[0];
+        if (ctx->graph == nullptr || x->ne[3] != 1 || 2 * rot > x->ne[0] ||
+            x->nb[3] > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+            return nullptr;
+        }
+        auto half = [&](int64_t offset) {
+            return ggml_view_3d(g, x, rot, x->ne[1], x->ne[2], x->nb[1], x->nb[2], offset * x->nb[0]);
+        };
+        auto xa  = half(0);
+        auto xb  = half(rot);
+        auto ya  = ggml_sub(g, ggml_mul(g, xa, cos), ggml_mul(g, xb, sin));
+        auto yb  = ggml_add(g, ggml_mul(g, xa, sin), ggml_mul(g, xb, cos));
+        auto out = ggml_set_inplace(g, x, ya, x->nb[1], x->nb[2], x->nb[3], 0);
+        if (!ggml_backend_supports_op(ctx->backend, out)) {
+            return nullptr;
+        }
+        ggml_build_forward_expand(ctx->graph, ya);
+        ggml_build_forward_expand(ctx->graph, yb);
+        return ggml_set_inplace(g, out, yb, x->nb[1], x->nb[2], x->nb[3], rot * x->nb[0]);
+    }
+
+    // pe layout of Rope::apply_rope ([2, 2, r, L] holding [[cos, -sin], [sin, cos]]).
+    static ggml_tensor* rope_tables_to_pe(ggml_context* ctx, ggml_tensor* cos, ggml_tensor* sin) {
+        auto c  = ggml_reshape_4d(ctx, cos, 1, cos->ne[0], cos->ne[1], 1);
+        auto s  = ggml_reshape_4d(ctx, sin, 1, sin->ne[0], sin->ne[1], 1);
+        auto pe = ggml_concat(ctx, c, ggml_neg(ctx, s), 0);
+        pe      = ggml_concat(ctx, pe, s, 0);
+        pe      = ggml_concat(ctx, pe, c, 0);
+        return ggml_reshape_4d(ctx, pe, 2, 2, cos->ne[0], cos->ne[1]);
+    }
 
     static ggml_tensor* attention_layout(ggml_context* ctx, ggml_tensor* x) {
         x = ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3));
         return ggml_reshape_3d(ctx, x, x->ne[0], x->ne[1], x->ne[2] * x->ne[3]);
     }
 
+    // Fallback rope on x in attention layout ([d, L, heads]) through the
+    // generic Rope::apply_rope, which expects [d, heads, L].
     static ggml_tensor* apply_partial_rope(ggml_context* ctx,
                                            ggml_tensor* x,
                                            ggml_tensor* pe) {
         int64_t rot_dim = pe->ne[2] * 2;
         GGML_ASSERT(rot_dim <= x->ne[0]);
-        auto rotated = Rope::apply_rope(ctx,
-                                        ggml_ext_slice(ctx, x, 0, 0, rot_dim),
-                                        pe,
-                                        false);
+        auto heads_major = ggml_permute(ctx, x, 0, 2, 1, 3);
+        auto rotated     = Rope::apply_rope(ctx,
+                                            ggml_ext_slice(ctx, heads_major, 0, 0, rot_dim),
+                                            pe,
+                                            false);
         if (rot_dim == x->ne[0]) {
             return rotated;
         }
-        auto tail = attention_layout(ctx, ggml_ext_slice(ctx, x, 0, rot_dim, x->ne[0]));
+        auto tail = ggml_ext_slice(ctx, x, 0, rot_dim, x->ne[0]);
         return ggml_concat(ctx, rotated, tail, 0);
     }
 
@@ -194,26 +288,39 @@ namespace MiniMaxH3 {
 
         ggml_tensor* forward(GGMLRunnerContext* ctx,
                              ggml_tensor* x,
-                             ggml_tensor* pe = nullptr) {
+                             ggml_tensor* rope_cos = nullptr,
+                             ggml_tensor* rope_sin = nullptr) {
             auto qkv_proj = std::dynamic_pointer_cast<Linear>(blocks["qkv_proj"]);
             auto q_norm   = std::dynamic_pointer_cast<RMSNorm>(blocks["q_norm"]);
             auto k_norm   = std::dynamic_pointer_cast<RMSNorm>(blocks["k_norm"]);
             auto out_proj = std::dynamic_pointer_cast<Linear>(blocks["out_proj"]);
 
+            ggml_context* g  = ctx->ggml_ctx;
             int64_t sequence = x->ne[1];
             int64_t batch    = x->ne[2] * x->ne[3];
-            auto qkv         = ggml_ext_chunk(ctx->ggml_ctx, qkv_proj->forward(ctx, x), 3, 0);
-            auto q           = ggml_reshape_4d(ctx->ggml_ctx, qkv[0], head_dim, heads, sequence, batch);
-            auto k           = ggml_reshape_4d(ctx->ggml_ctx, qkv[1], head_dim, heads, sequence, batch);
-            auto v           = ggml_reshape_4d(ctx->ggml_ctx, qkv[2], head_dim, heads, sequence, batch);
-            q                = q_norm->forward(ctx, q);
-            k                = k_norm->forward(ctx, k);
-            if (pe != nullptr) {
-                q = apply_partial_rope(ctx->ggml_ctx, q, pe);
-                k = apply_partial_rope(ctx->ggml_ctx, k, pe);
-            } else {
-                q = attention_layout(ctx->ggml_ctx, q);
-                k = attention_layout(ctx->ggml_ctx, k);
+            int64_t inner    = heads * head_dim;
+            auto qkv         = qkv_proj->forward(ctx, x);
+            // Strided views into the fused projection: the norms and the
+            // layout copies read them directly, so q/k/v are never copied out.
+            auto head_view = [&](int64_t index) {
+                return ggml_view_4d(g, qkv, head_dim, heads, sequence, batch,
+                                    head_dim * ggml_element_size(qkv), qkv->nb[1], qkv->nb[1] * sequence,
+                                    static_cast<size_t>(index) * inner * ggml_element_size(qkv));
+            };
+            auto q = attention_layout(g, q_norm->forward(ctx, head_view(0)));
+            auto k = attention_layout(g, k_norm->forward(ctx, head_view(1)));
+            auto v = head_view(2);
+            if (rope_cos != nullptr) {
+                auto rq = rope_in_place(ctx, q, rope_cos, rope_sin);
+                auto rk = rq != nullptr ? rope_in_place(ctx, k, rope_cos, rope_sin) : nullptr;
+                if (rq != nullptr && rk != nullptr) {
+                    q = rq;
+                    k = rk;
+                } else {
+                    auto pe = rope_tables_to_pe(g, rope_cos, rope_sin);
+                    q       = apply_partial_rope(g, q, pe);
+                    k       = apply_partial_rope(g, k, pe);
+                }
             }
             auto out = ggml_ext_attention_ext(ctx,
                                               q,
@@ -233,9 +340,9 @@ namespace MiniMaxH3 {
             blocks["norm1"] = std::make_shared<RMSNorm>(config.hidden_size, config.norm_eps);
             blocks["norm2"] = std::make_shared<RMSNorm>(config.hidden_size, config.norm_eps);
             blocks["attn"]  = std::make_shared<Attention>(config.hidden_size,
-                                                         config.num_attention_heads,
-                                                         config.attention_head_dim,
-                                                         config.qk_norm_eps);
+                                                          config.num_attention_heads,
+                                                          config.attention_head_dim,
+                                                          config.qk_norm_eps);
             blocks["mlp"]   = std::make_shared<MLP>(config.hidden_size, config.ffn_hidden_size);
         }
 
@@ -338,7 +445,11 @@ namespace MiniMaxH3 {
         return ggml_ext_chunk(ctx, selected, expand, 0);
     }
 
-    static ggml_tensor* modulate_segments(ggml_context* ctx,
+    // x * (1 + scale) + shift per token span, assembled with concatenations:
+    // the spans are contiguous token ranges, so the last concat is one pass
+    // over the sequence and the earlier ones only cover the small spans. The
+    // 1 + scale term is folded on the modulation row, not on the tokens.
+    static ggml_tensor* modulate_segments(GGMLRunnerContext* ctx,
                                           ggml_tensor* x,
                                           ggml_tensor* projection,
                                           const std::vector<TokenModulationSpan>& segments,
@@ -347,37 +458,39 @@ namespace MiniMaxH3 {
                                           int modalities,
                                           int shift_index,
                                           int scale_index) {
+        ggml_context* g  = ctx->ggml_ctx;
         ggml_tensor* out = nullptr;
         for (const auto& segment : segments) {
-            auto mods = modulation_row(ctx,
-                                       projection,
-                                       hidden_size,
-                                       expand,
-                                       modalities,
-                                       segment.modulation_row);
-            auto part = ggml_ext_slice(ctx, x, 1, segment.start, segment.end);
-            part      = ggml_add(ctx,
-                                 ggml_add(ctx, part, ggml_mul(ctx, part, mods[scale_index])),
-                                 mods[shift_index]);
-            out       = out == nullptr ? part : ggml_concat(ctx, out, part, 1);
+            auto mods  = modulation_row(g,
+                                        projection,
+                                        hidden_size,
+                                        expand,
+                                        modalities,
+                                        segment.modulation_row);
+            auto scale = ggml_scale_bias(g, mods[scale_index], 1.f, 1.f);
+            auto part  = ggml_ext_slice(g, x, 1, segment.start, segment.end);
+            part       = ggml_add(g, ggml_mul(g, part, scale), mods[shift_index]);
+            out        = out == nullptr ? part : ggml_concat(g, out, part, 1);
         }
         return out;
     }
 
-    static ggml_tensor* gated_residual_segments(ggml_context* ctx,
+    // x + gate * update per token span.
+    static ggml_tensor* gated_residual_segments(GGMLRunnerContext* ctx,
                                                 ggml_tensor* x,
                                                 ggml_tensor* update,
                                                 ggml_tensor* projection,
                                                 const std::vector<TokenModulationSpan>& segments,
                                                 int64_t hidden_size,
                                                 int gate_index) {
+        ggml_context* g  = ctx->ggml_ctx;
         ggml_tensor* out = nullptr;
         for (const auto& segment : segments) {
-            auto mods = modulation_row(ctx, projection, hidden_size, 6, 3, segment.modulation_row);
-            auto base = ggml_ext_slice(ctx, x, 1, segment.start, segment.end);
-            auto add  = ggml_ext_slice(ctx, update, 1, segment.start, segment.end);
-            auto part = ggml_add(ctx, base, ggml_mul(ctx, add, mods[gate_index]));
-            out       = out == nullptr ? part : ggml_concat(ctx, out, part, 1);
+            auto mods = modulation_row(g, projection, hidden_size, 6, 3, segment.modulation_row);
+            auto base = ggml_ext_slice(g, x, 1, segment.start, segment.end);
+            auto add  = ggml_ext_slice(g, update, 1, segment.start, segment.end);
+            auto part = ggml_add(g, base, ggml_mul(g, add, mods[gate_index]));
+            out       = out == nullptr ? part : ggml_concat(g, out, part, 1);
         }
         return out;
     }
@@ -390,11 +503,11 @@ namespace MiniMaxH3 {
             blocks["norm1"]      = std::make_shared<RMSNorm>(config.hidden_size, config.norm_eps);
             blocks["norm2"]      = std::make_shared<RMSNorm>(config.hidden_size, config.norm_eps);
             blocks["attn"]       = std::make_shared<Attention>(config.hidden_size,
-                                                         config.num_attention_heads,
-                                                         config.attention_head_dim,
-                                                         config.qk_norm_eps);
+                                                               config.num_attention_heads,
+                                                               config.attention_head_dim,
+                                                               config.qk_norm_eps);
             blocks["mlp"]        = std::make_shared<MLP>(config.hidden_size,
-                                                  config.ffn_hidden_size);
+                                                         config.ffn_hidden_size);
             blocks["adaln_proj"] = std::make_shared<AdaLayerNormModulation>(config.time_embed_dim,
                                                                             config.hidden_size,
                                                                             6,
@@ -403,11 +516,16 @@ namespace MiniMaxH3 {
                                                                             config.uses_adaln_curves());
         }
 
+        void set_token_chunk(int64_t value) {
+            std::dynamic_pointer_cast<MLP>(blocks["mlp"])->token_chunk = value;
+        }
+
         ggml_tensor* forward(GGMLRunnerContext* ctx,
                              ggml_tensor* x,
                              ggml_tensor* t_emb,
                              const std::vector<TokenModulationSpan>& segments,
-                             ggml_tensor* pe) {
+                             ggml_tensor* rope_cos,
+                             ggml_tensor* rope_sin) {
             auto norm1 = std::dynamic_pointer_cast<RMSNorm>(blocks["norm1"]);
             auto norm2 = std::dynamic_pointer_cast<RMSNorm>(blocks["norm2"]);
             auto attn  = std::dynamic_pointer_cast<Attention>(blocks["attn"]);
@@ -415,7 +533,7 @@ namespace MiniMaxH3 {
             auto adaln = std::dynamic_pointer_cast<AdaLayerNormModulation>(blocks["adaln_proj"]);
             auto mods  = adaln->forward(ctx, t_emb);
 
-            auto h = modulate_segments(ctx->ggml_ctx,
+            auto h = modulate_segments(ctx,
                                        norm1->forward(ctx, x),
                                        mods,
                                        segments,
@@ -424,14 +542,14 @@ namespace MiniMaxH3 {
                                        3,
                                        0,
                                        1);
-            x      = gated_residual_segments(ctx->ggml_ctx,
+            x      = gated_residual_segments(ctx,
                                              x,
-                                             attn->forward(ctx, h, pe),
+                                             attn->forward(ctx, h, rope_cos, rope_sin),
                                              mods,
                                              segments,
                                              config.hidden_size,
                                              2);
-            h      = modulate_segments(ctx->ggml_ctx,
+            h      = modulate_segments(ctx,
                                        norm2->forward(ctx, x),
                                        mods,
                                        segments,
@@ -440,7 +558,7 @@ namespace MiniMaxH3 {
                                        3,
                                        3,
                                        4);
-            return gated_residual_segments(ctx->ggml_ctx,
+            return gated_residual_segments(ctx,
                                            x,
                                            mlp->forward(ctx, h),
                                            mods,
@@ -508,6 +626,16 @@ namespace MiniMaxH3 {
                 blocks["blocks." + std::to_string(i)] = std::make_shared<TransformerBlock>(config);
             }
             blocks["final_layer"] = std::make_shared<FinalLayer>(config);
+            set_token_chunk(config.token_chunk);
+        }
+
+        void set_token_chunk(int64_t value) {
+            for (auto& [name, block] : blocks) {
+                auto transformer_block = std::dynamic_pointer_cast<TransformerBlock>(block);
+                if (transformer_block) {
+                    transformer_block->set_token_chunk(value);
+                }
+            }
         }
 
         void init_params(ggml_context* ctx,
@@ -554,8 +682,9 @@ namespace MiniMaxH3 {
                                      curve_fractions));
         }
 
-        ggml_tensor* build_rope(GGMLRunnerContext* ctx,
-                                ggml_tensor* position_ids) {
+        // cos and sin tables, [3 * inv_freq_len, tokens, 1], broadcast over heads.
+        std::pair<ggml_tensor*, ggml_tensor*> build_rope(GGMLRunnerContext* ctx,
+                                                         ggml_tensor* position_ids) {
             auto inv            = ggml_reshape_2d(ctx->ggml_ctx,
                                                   params["rope.inv_freq"],
                                                   config.rope_inv_freq_len,
@@ -572,13 +701,9 @@ namespace MiniMaxH3 {
                 auto a            = ggml_mul(ctx->ggml_ctx, expanded_inv, pos);
                 angles            = angles == nullptr ? a : ggml_concat(ctx->ggml_ctx, angles, a, 0);
             }
-            auto c  = ggml_reshape_4d(ctx->ggml_ctx, ggml_cos(ctx->ggml_ctx, angles), 1, angles->ne[0], angles->ne[1], 1);
-            auto s  = ggml_reshape_4d(ctx->ggml_ctx, ggml_sin(ctx->ggml_ctx, angles), 1, angles->ne[0], angles->ne[1], 1);
-            auto ns = ggml_neg(ctx->ggml_ctx, s);
-            auto pe = ggml_concat(ctx->ggml_ctx, c, ns, 0);
-            pe      = ggml_concat(ctx->ggml_ctx, pe, s, 0);
-            pe      = ggml_concat(ctx->ggml_ctx, pe, c, 0);
-            return ggml_reshape_4d(ctx->ggml_ctx, pe, 2, 2, angles->ne[0], angles->ne[1]);
+            auto c = ggml_reshape_3d(ctx->ggml_ctx, ggml_cos(ctx->ggml_ctx, angles), angles->ne[0], angles->ne[1], 1);
+            auto s = ggml_reshape_3d(ctx->ggml_ctx, ggml_sin(ctx->ggml_ctx, angles), angles->ne[0], angles->ne[1], 1);
+            return {c, s};
         }
 
         std::pair<ggml_tensor*, ggml_tensor*> forward(GGMLRunnerContext* ctx,
@@ -687,10 +812,10 @@ namespace MiniMaxH3 {
                                         curve_indices,
                                         curve_upper_indices,
                                         curve_fractions);
-            auto pe    = build_rope(ctx, position_ids);
+            auto rope  = build_rope(ctx, position_ids);
             for (int64_t i = 0; i < config.num_layers; ++i) {
                 auto block = std::dynamic_pointer_cast<TransformerBlock>(blocks["blocks." + std::to_string(i)]);
-                h          = block->forward(ctx, h, t_emb, segments, pe);
+                h          = block->forward(ctx, h, t_emb, segments, rope.first, rope.second);
                 sd::ggml_graph_cut::mark_graph_cut(h,
                                                    "minimax_h3.blocks." + std::to_string(i),
                                                    "hidden_states");
@@ -962,13 +1087,29 @@ namespace MiniMaxH3 {
         sd::Tensor<int32_t> curve_upper_index_input_cache;
         sd::Tensor<float> curve_fraction_input_cache;
 
+        static Config configure(Config config, const char* model_args) {
+            for (const auto& [key, value] : parse_key_value_args(model_args, "model arg")) {
+                if (key == "token_chunk") {
+                    config.token_chunk = DiT::parse_token_chunk_arg(value, "MiniMax-H3", config.token_chunk);
+                }
+            }
+            return config;
+        }
+
         MiniMaxH3Runner(ggml_backend_t backend,
                         const String2TensorStorage& tensors,
                         const std::string& prefix                           = "model.diffusion_model",
-                        std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
+                        std::shared_ptr<RunnerWeightManager> weight_manager = nullptr,
+                        const char* model_args                              = nullptr)
             : DiffusionModelRunner(backend, prefix, weight_manager),
-              config(Config::detect_from_weights(tensors, prefix)),
+              config(configure(Config::detect_from_weights(tensors, prefix), model_args)),
               model(config) {
+            if (config.token_chunk == 0) {
+                LOG_INFO("MiniMax-H3 feed-forward token chunking disabled");
+            } else if (config.token_chunk > 0) {
+                LOG_INFO("MiniMax-H3 feed-forward token chunking: %lld tokens per range",
+                         static_cast<long long>(config.token_chunk));
+            }
             model.init(params_ctx, tensors, prefix);
         }
 
@@ -1119,7 +1260,8 @@ namespace MiniMaxH3 {
                 timestep_features = make_input(timestep_feature_input_cache);
             }
 
-            auto runner_ctx = get_context();
+            auto graph      = new_graph_custom(H3_GRAPH_SIZE);
+            auto runner_ctx = get_context(graph);
             auto output     = model.forward(&runner_ctx,
                                             video,
                                             audio,
@@ -1142,7 +1284,6 @@ namespace MiniMaxH3 {
                                                     output.second,
                                                     1.f + (audio_scale - 1.f) * sigma_a));
             auto merged   = merge_av_latents(compute_ctx, output.first, output.second);
-            auto graph    = new_graph_custom(H3_GRAPH_SIZE);
             ggml_build_forward_expand(graph, merged);
             return graph;
         }

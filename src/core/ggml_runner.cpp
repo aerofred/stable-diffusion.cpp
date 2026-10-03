@@ -1047,6 +1047,9 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
     struct PhaseTiming {
         int64_t measure  = 0;
         int64_t weights  = 0;
+        int64_t activate = 0;
+        int64_t capacity = 0;
+        int64_t prepare  = 0;
         int64_t alloc    = 0;
         int64_t upload   = 0;
         int64_t prefetch = 0;
@@ -1230,6 +1233,9 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
             return fail_segment("weight preparation");
         }
         lap(timing.weights);
+        timing.activate += weights.last_start_timing().activate_us;
+        timing.capacity += weights.last_start_timing().capacity_us;
+        timing.prepare += weights.last_start_timing().prepare_us;
         // Preparing weights can execute LoRA graphs and reclaim an idle workspace;
         // only then does the capacity check need to run again.
         bool recheck = false;
@@ -1327,9 +1333,11 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
         logged_compute_bytes_ = std::move(peak_compute_bytes);
         logged_segment_count_ = plan.segments.size();
     }
-    LOG_DEBUG("%s graph timing (%zu segment%s): measure %.1f ms, weights %.1f ms, alloc %.1f ms, upload %.1f ms, prefetch %.1f ms, compute %.1f ms, capture %.1f ms, total %.1f ms",
+    LOG_DEBUG("%s graph timing (%zu segment%s): measure %.1f ms, weights %.1f ms (activate %.1f, capacity %.1f, prepare %.1f), alloc %.1f ms, upload %.1f ms, prefetch %.1f ms, compute %.1f ms, capture %.1f ms, total %.1f ms",
               get_desc().c_str(), plan.segments.size(), plan.segments.size() == 1 ? "" : "s",
-              timing.measure / 1000.0, timing.weights / 1000.0, timing.alloc / 1000.0, timing.upload / 1000.0,
+              timing.measure / 1000.0, timing.weights / 1000.0,
+              timing.activate / 1000.0, timing.capacity / 1000.0, timing.prepare / 1000.0,
+              timing.alloc / 1000.0, timing.upload / 1000.0,
               timing.prefetch / 1000.0, timing.compute / 1000.0, timing.capture / 1000.0,
               (ggml_time_us() - graph_start) / 1000.0);
     return output;

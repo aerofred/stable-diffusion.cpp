@@ -148,18 +148,25 @@ namespace sd {
 
     bool SegmentWeightPipeline::segment_start(size_t segment_index, const std::function<bool()>& ensure_capacity) {
         GGML_ASSERT(pinned_params_.empty());
+        last_start_timing_ = {};
+        int64_t t0         = ggml_time_us();
         activate(segment_index);
+        int64_t t1                     = ggml_time_us();
+        last_start_timing_.activate_us = t1 - t0;
         if (!ensure_capacity()) {
             return false;
         }
-        auto manager = residency_manager_.lock();
+        int64_t t2                     = ggml_time_us();
+        last_start_timing_.capacity_us = t2 - t1;
+        auto manager                   = residency_manager_.lock();
         if (manager == nullptr) {
             return segment_params_[segment_index].empty();
         }
         if (!manager->prepare_params(segment_params_[segment_index])) {
             return false;
         }
-        pinned_params_ = segment_params_[segment_index];
+        last_start_timing_.prepare_us = ggml_time_us() - t2;
+        pinned_params_                = segment_params_[segment_index];
         return true;
     }
 

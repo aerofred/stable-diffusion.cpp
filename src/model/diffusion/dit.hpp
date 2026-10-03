@@ -1,6 +1,10 @@
 #ifndef __SD_MODEL_DIFFUSION_DIT_HPP__
 #define __SD_MODEL_DIFFUSION_DIT_HPP__
 
+#include <algorithm>
+#include <cstdlib>
+#include <string>
+
 #include "core/ggml_extend.h"
 #include "core/ggml_runner.h"
 
@@ -174,6 +178,40 @@ namespace DiT {
         x = ggml_ext_cont(ctx, ggml_ext_torch_permute(ctx, x, 0, 2, 1, 3));      // [N*C*t_len, pt, h_len*ph, w_len*pw]
         x = ggml_reshape_4d(ctx, x, pw * w_len, ph * h_len, pt * t_len, C * N);  // [N*C, t_len*pt, h_len*ph, w_len*pw]
         return x;
+    }
+
+    // Tokens per range for a stage whose f32 temporaries take bytes_per_token
+    // per token: <0 sizes ranges for about 256 MiB of temporaries, 0 disables
+    // chunking, >0 is an explicit token count.
+    inline int64_t token_chunk_size(int64_t setting, int64_t bytes_per_token, int64_t n_tokens) {
+        if (setting == 0) {
+            return n_tokens;
+        }
+        if (setting > 0) {
+            return std::min(setting, n_tokens);
+        }
+        // At most 8 ranges per stage: every range adds graph nodes, and
+        // beyond that the saving per extra range is small.
+        constexpr int64_t max_ranges = 8;
+        int64_t tokens               = (int64_t(256) << 20) / std::max<int64_t>(bytes_per_token, 1);
+        tokens                       = std::max<int64_t>(1024, tokens - tokens % 256);
+        tokens                       = std::max<int64_t>(tokens, (n_tokens + max_ranges - 1) / max_ranges);
+        return std::min(tokens, n_tokens);
+    }
+
+    // Parses the `token_chunk` model arg: auto (-1), 0 (disabled) or a token count.
+    inline int64_t parse_token_chunk_arg(const std::string& value, const char* model, int64_t fallback) {
+        if (value == "auto") {
+            return -1;
+        }
+        char* end        = nullptr;
+        long long parsed = std::strtoll(value.c_str(), &end, 10);
+        if (!value.empty() && end != nullptr && *end == '\0' && parsed >= 0) {
+            return parsed;
+        }
+        LOG_WARN("ignoring invalid %s model arg 'token_chunk=%s' (expected auto, 0 or a token count)",
+                 model, value.c_str());
+        return fallback;
     }
 }  // namespace DiT
 
