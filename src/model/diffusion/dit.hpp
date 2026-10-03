@@ -199,6 +199,71 @@ namespace DiT {
         return std::min(tokens, n_tokens);
     }
 
+    // Writes token ranges of a [dim, tokens] activation into `out` (contiguous,
+    // owned by the caller) with chained in-place sets, so the result stays one
+    // tensor whose root is the chain's last node (what a graph cut caches).
+    // GGML_OP_SET keeps its destination offset in an int32 op param and asserts
+    // offset < 1 GiB, so ranges past that bound go into a second chain built on
+    // suffix views of `out`, which restart the offset at zero. A suffix view
+    // cannot grow back to the full tensor, so `finish` joins the chains with a
+    // one-element set on the full chain whose value is routed through the
+    // suffix chain: the element is rewritten with its own value and the result
+    // now depends on every range. Below 1 GiB the graph is a single chain.
+    struct TokenRangeWriter {
+        TokenRangeWriter(ggml_context* ctx, ggml_tensor* out)
+            : ctx_(ctx), out_(out), head_(out) {
+            GGML_ASSERT(ggml_is_contiguous(out) && out->ne[2] == 1 && out->ne[3] == 1);
+            GGML_ASSERT(out->nb[1] < max_set_offset);
+        }
+
+        // Writes `y` (count * dim elements) over tokens [start, start + count).
+        // Ranges past the 1 GiB bound must arrive in increasing token order.
+        // Returns the set node, which callers may probe for backend support.
+        ggml_tensor* write(ggml_tensor* y, int64_t start, int64_t count) {
+            GGML_ASSERT(ggml_nelements(y) == count * out_->ne[0]);
+            const size_t nb1 = out_->nb[1];
+            const size_t nb2 = nb1 * static_cast<size_t>(count);
+            size_t offset    = static_cast<size_t>(start) * nb1;
+            if (offset < max_set_offset) {
+                head_ = ggml_set_inplace(ctx_, head_, y, nb1, nb2, nb2, offset);
+                return head_;
+            }
+            if (tail_ != nullptr) {
+                GGML_ASSERT(start >= tail_start_);
+                offset -= static_cast<size_t>(tail_start_) * nb1;
+            }
+            if (tail_ == nullptr || offset >= max_set_offset) {
+                tail_       = ggml_view_2d(ctx_, tail_ != nullptr ? tail_ : out_, out_->ne[0], out_->ne[1] - start, nb1, offset);
+                tail_start_ = start;
+                offset      = 0;
+            }
+            tail_ = ggml_set_inplace(ctx_, tail_, y, nb1, nb2, nb2, offset);
+            return tail_;
+        }
+
+        ggml_tensor* finish() {
+            if (tail_ == nullptr) {
+                return head_;
+            }
+            const size_t nb1 = out_->nb[1];
+            auto first       = ggml_view_1d(ctx_, head_, 1, 0);
+            auto last        = ggml_view_1d(ctx_, tail_, 1, 0);
+            auto join        = ggml_view_1d(ctx_, ggml_concat(ctx_, first, last, 0), 1, 0);
+            head_            = ggml_set_inplace(ctx_, head_, join, nb1, nb1, nb1, 0);
+            tail_            = nullptr;
+            return head_;
+        }
+
+    private:
+        static constexpr size_t max_set_offset = static_cast<size_t>(1) << 30;
+
+        ggml_context* ctx_;
+        ggml_tensor* out_;
+        ggml_tensor* head_;
+        ggml_tensor* tail_  = nullptr;
+        int64_t tail_start_ = 0;
+    };
+
     // Parses the `token_chunk` model arg: auto (-1), 0 (disabled) or a token count.
     inline int64_t parse_token_chunk_arg(const std::string& value, const char* model, int64_t fallback) {
         if (value == "auto") {

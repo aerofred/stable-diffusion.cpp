@@ -180,27 +180,24 @@ namespace MiniMaxH3 {
                                                            n_tokens);
             const bool chunked     = !token_chunk_disabled_ && chunk < n_tokens &&
                                  x->type == GGML_TYPE_F32 && x->ne[2] == 1 && x->ne[3] == 1 &&
-                                 ggml_is_contiguous(x) &&
-                                 ggml_nbytes(x) <= static_cast<size_t>(std::numeric_limits<int32_t>::max());
+                                 ggml_is_contiguous(x);
             if (!chunked) {
                 return feed_forward(ctx, x);
             }
-            ggml_tensor* out = x;
+            DiT::TokenRangeWriter out(g, x);
             for (int64_t start = 0; start < n_tokens; start += chunk) {
                 const int64_t count = std::min(chunk, n_tokens - start);
                 auto x_c            = ggml_view_2d(g, x, x->ne[0], count, x->nb[1], static_cast<size_t>(start) * x->nb[1]);
                 auto y              = feed_forward(ctx, x_c);
-                auto next           = ggml_set_inplace(g, out, y, x->nb[1], x->nb[2], x->nb[3],
-                                                       static_cast<size_t>(start) * x->nb[1]);
-                if (start == 0 && !ggml_backend_supports_op(ctx->backend, next)) {
+                auto set            = out.write(y, start, count);
+                if (start == 0 && !ggml_backend_supports_op(ctx->backend, set)) {
                     LOG_WARN("%s does not support GGML_OP_SET; MiniMax-H3 feed-forward token chunking disabled",
                              ggml_backend_name(ctx->backend));
                     token_chunk_disabled_ = true;
                     return feed_forward(ctx, x);
                 }
-                out = next;
             }
-            return out;
+            return out.finish();
         }
     };
 

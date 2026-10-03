@@ -771,9 +771,7 @@ namespace LTXV {
                                  ctx->flash_attn_enabled && !ctx->sage_attn_enabled &&
                                  x->type == GGML_TYPE_F32 && x->ne[2] == 1 && x->ne[3] == 1 &&
                                  x->ne[0] == query_dim && pe_per_token > 0 && k_pe_per_token > 0 &&
-                                 k->ne[2] == 1 && k->ne[3] == 1 &&
-                                 ggml_nbytes(x) <= static_cast<size_t>(std::numeric_limits<int32_t>::max()) &&
-                                 ggml_nbytes(k) <= static_cast<size_t>(std::numeric_limits<int32_t>::max());
+                                 k->ne[2] == 1 && k->ne[3] == 1;
             bool k_roped = false;
             if (chunked) {
                 ggml_context* g = ctx->ggml_ctx;
@@ -782,17 +780,16 @@ namespace LTXV {
                 if (k_pe != nullptr) {
                     const int64_t k_chunk = token_chunk_size(q_chunk, inner_dim * static_cast<int64_t>(sizeof(float)) * 10, lk);
                     if (k_chunk < lk) {
-                        ggml_tensor* k_rope = ggml_cont(g, k);
+                        DiT::TokenRangeWriter k_rope(g, ggml_cont(g, k));
                         for (int64_t start = 0; start < lk; start += k_chunk) {
                             const int64_t count = std::min(k_chunk, lk - start);
                             auto k_c            = token_range(g, k, lk, start, count);
                             auto kpe_c          = ggml_view_4d(g, k_pe, k_pe->ne[0], k_pe->ne[1], k_pe->ne[2], count * k_pe_per_token,
                                                                k_pe->nb[1], k_pe->nb[2], k_pe->nb[3], start * k_pe_per_token * k_pe->nb[3]);
                             auto r              = apply_hidden_rope(g, k_c, kpe_c, heads, dim_head, rope_interleaved);
-                            k_rope              = ggml_set_inplace(g, k_rope, r, k_rope->nb[1], k_rope->nb[2], k_rope->nb[3],
-                                                                   static_cast<size_t>(start) * k_rope->nb[1]);
+                            k_rope.write(r, start, count);
                         }
-                        k = k_rope;
+                        k = k_rope.finish();
                     } else {
                         k = apply_hidden_rope(g, k, k_pe, heads, dim_head, rope_interleaved);
                     }
@@ -811,8 +808,8 @@ namespace LTXV {
                 auto k16            = prepare_kv(k);
                 auto v16            = prepare_kv(v);
                 const float scale   = 1.f / std::sqrt(static_cast<float>(dim_head));
-                ggml_tensor* result = ggml_cont(g, x);
-                bool supported      = true;
+                DiT::TokenRangeWriter result(g, ggml_cont(g, x));
+                bool supported = true;
                 for (int64_t start = 0; start < n_q && supported; start += chunk) {
                     const int64_t count = std::min(chunk, n_q - start);
                     auto x_c            = token_range(g, x, n_q, start, count);
@@ -847,15 +844,14 @@ namespace LTXV {
                         out_c               = ggml_reshape_3d(g, out4, inner_dim, count, 1);
                     }
                     auto o_c = to_out_0->forward(ctx, out_c);
-                    result   = ggml_set_inplace(g, result, o_c, result->nb[1], result->nb[2], result->nb[3],
-                                                static_cast<size_t>(start) * result->nb[1]);
-                    if (start == 0 && !ggml_backend_supports_op(ctx->backend, result)) {
+                    auto set = result.write(o_c, start, count);
+                    if (start == 0 && !ggml_backend_supports_op(ctx->backend, set)) {
                         supported = false;
                         break;
                     }
                 }
                 if (supported) {
-                    return result;
+                    return result.finish();
                 }
                 LOG_WARN("%s lacks flash attention or GGML_OP_SET support; LTX query chunking disabled",
                          ggml_backend_name(ctx->backend));
@@ -1307,15 +1303,14 @@ namespace LTXV {
             const int64_t n_tokens = x->ne[1];
             const int64_t chunk    = token_chunk_size(token_chunk, dim * 4 * static_cast<int64_t>(sizeof(float)) * 2, n_tokens);
             const bool chunked     = !token_chunk_disabled_ && chunk < n_tokens &&
-                                 x->type == GGML_TYPE_F32 && x->ne[2] == 1 && x->ne[3] == 1 &&
-                                 ggml_nbytes(x) <= static_cast<size_t>(std::numeric_limits<int32_t>::max());
+                                 x->type == GGML_TYPE_F32 && x->ne[2] == 1 && x->ne[3] == 1;
             if (!chunked) {
                 auto h = rms_norm(g, x);
                 h      = LTXV::modulate(g, h, shift, scale);
                 h      = ff->forward(ctx, h);
                 return ggml_add(g, x, apply_gate(g, h, gate));
             }
-            ggml_tensor* out = ggml_cont(g, x);
+            DiT::TokenRangeWriter out(g, ggml_cont(g, x));
             for (int64_t start = 0; start < n_tokens; start += chunk) {
                 const int64_t count = std::min(chunk, n_tokens - start);
                 auto x_c            = token_range(g, x, n_tokens, start, count);
@@ -1326,17 +1321,15 @@ namespace LTXV {
                 h                   = ff->forward(ctx, h);
                 h                   = apply_gate(g, h, token_range(g, gate, n_tokens, start, count));
                 auto y              = ggml_add(g, x_c, h);
-                auto next           = ggml_set_inplace(g, out, y, out->nb[1], out->nb[2], out->nb[3],
-                                                       static_cast<size_t>(start) * out->nb[1]);
-                if (start == 0 && !ggml_backend_supports_op(ctx->backend, next)) {
+                auto set            = out.write(y, start, count);
+                if (start == 0 && !ggml_backend_supports_op(ctx->backend, set)) {
                     LOG_WARN("%s does not support GGML_OP_SET; LTX feed-forward token chunking disabled",
                              ggml_backend_name(ctx->backend));
                     token_chunk_disabled_ = true;
                     return gated_feed_forward(ctx, ff, x, shift, scale, gate, dim);
                 }
-                out = next;
             }
-            return out;
+            return out.finish();
         }
 
         void init_params(ggml_context* ctx,
