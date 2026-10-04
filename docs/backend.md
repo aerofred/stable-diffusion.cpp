@@ -65,11 +65,14 @@ sd-cli -m model.safetensors -p "a cat" --backend "diffusion=cuda0&cuda1"
 ```
 
 The module's transformer blocks are then distributed across the listed devices
-in contiguous ranges sized proportionally to each device's free memory (minus a
-compute-buffer headroom of about 2 GiB per device), and the
-module's graphs are executed with a `ggml_backend_sched` that runs each block
-on the device holding its weights, copying the residual stream at the range
-boundaries. The first device in the list is the module's main device: it also
+in contiguous ranges: the first device is filled up to its free memory (minus a
+compute-buffer headroom of about 2 GiB per device) before the next one receives
+blocks, so a model that fits on the first device stays there. Only when the
+weights exceed the combined budget are they spread proportionally to each
+device's budget. The module's graphs are executed with a `ggml_backend_sched`
+that runs each block on the device holding its weights, copying the residual
+stream at the range boundaries. Execution is sequential across devices: a
+split does not run blocks on two GPUs at the same time. The first device in the list is the module's main device: it also
 holds the non-block tensors (embeddings, final norms, small sub-runners such as
 CLIP models or projectors) and the graph inputs/outputs.
 
@@ -84,10 +87,64 @@ with `--params-backend diffusion=disk`, released directly from) its own device;
 an explicit assignment such as `te=cpu` keeps the parameters on that backend
 and stages each range to its device on demand.
 
-Layer split uses the fixed graph-cut plan to assign blocks across devices, but
-single-device segmented execution and next-segment prefetch are disabled for
-the split module. `--max-vram` can still provide the per-device limits used by
-layer split and auto-fit.
+Layer split uses the fixed graph-cut plan to assign blocks across devices. When
+the module's weights and compute buffers fit resident on the listed devices, the
+whole graph runs in one scheduler pass. Otherwise the graph runs segment by
+segment, exactly like single-device segmented execution: each block's weights are
+staged to (and prefetched on) the device that owns it, the residual stream is
+copied across devices only at range boundaries, and the resident weight cache
+spans every listed device. Weights that exceed the combined device budgets are
+spread across the devices in proportion to their budgets and streamed per segment
+instead of being rejected. `--max-vram` can still provide the per-device limits
+used by layer split and auto-fit.
+
+Note that layer split pools the devices' memory for *weights*, not for
+activations: every block still executes on a single device, so a module's
+compute buffer (which grows with resolution and frame count) must fit on each
+device individually. Splitting a module across two GPUs therefore does not raise
+the maximum resolution or frame count; it lets more of a large model stay
+resident instead of being re-staged from RAM at every step.
+
+### Placement policy (`--split-ratio`)
+
+`--split-ratio` chooses how a layer split places blocks on the listed devices:
+
+- `auto` (default): on the first split graph each device is benchmarked once
+  (an f16 matmul and a pinned host-to-device upload, about 100 ms per device).
+  Each block then goes where its estimated cost is lowest: compute time on the
+  device, plus the weight transfer when the block does not fit resident, plus
+  the residual-stream copy when the block changes device. A block is streamed
+  from RAM on a fast device whenever that beats running it resident on a slower
+  one, so a GPU on a narrow PCIe link only receives blocks it can keep resident
+  and only when that is faster than streaming. The log prints the measured
+  profile and the resulting placement with its estimated time per graph.
+- `vram`: fill each device by free memory in `--backend` order (previous behavior).
+- `r0,r1,...`: fixed fractions of the parameter-bearing blocks per device, in
+  `--backend` order, e.g. `--split-ratio 0.7,0.3`.
+
+```shell
+sd-cli -m model.safetensors -p "a cat" --backend "diffusion=cuda0&cuda1" --split-ratio 0.7,0.3
+```
+
+### Parallel classifier-free guidance (`--backend cfg=<device>`)
+
+With `cfg=<device>`, a second copy of the diffusion model is built on that GPU
+and runs the unconditional pass of every sampling step concurrently with the
+conditional pass on the diffusion device:
+
+```shell
+sd-cli -m model.safetensors -p "a cat" --cfg-scale 3.5 --backend diffusion=cuda0,cfg=cuda1
+```
+
+Both devices hold or stream their own copy of the weights (with
+`--offload-to-cpu` this also doubles the diffusion model's RAM copy), so the
+step time becomes the slower of the two passes instead of their sum. This only
+helps when the model fits resident on both devices, or streams fast enough on
+both. The replica follows the `diffusion` params backend and LoRA settings. The
+sequential path is kept when there is no unconditional pass (`--cfg-scale 1`),
+for the high-noise model of two-stage models, with ControlNet, with step
+caches (EasyCache and friends), with generation extensions such as PhotoMaker,
+and when `cfg` names the diffusion device itself.
 
 Use `--list-devices` to see the device names available on the system.
 

@@ -22,6 +22,10 @@ namespace sd {
                                                   const std::string& name,
                                                   ggml_tensor* source,
                                                   ggml_status& status);
+        // Copies source into this entry when its tensor already has the same
+        // layout on the target device, so a cut that recurs every graph does
+        // not reallocate its cache buffer.
+        bool refill(ggml_backend_t backend, ggml_tensor* source);
     };
     using CachedTensors = std::map<std::string, std::unique_ptr<CachedTensor>>;
 
@@ -57,9 +61,15 @@ namespace sd {
             : backend_(backend) {}
         ggml_tensor* get(const std::string& name) const;
         size_t resident_bytes(ggml_backend_dev_t device) const;
+        // Cut outputs are kept on the device that produced them (the segment's
+        // backend); a null backend selects the runner's primary backend.
         size_t estimate_output_bytes(ggml_cgraph* graph,
-                                     const ggml_graph_cut::Segment& segment) const;
-        ggml_status capture(ggml_cgraph* graph, const ggml_graph_cut::Segment& segment, const char* log_desc);
+                                     const ggml_graph_cut::Segment& segment,
+                                     ggml_backend_t backend = nullptr) const;
+        ggml_status capture(ggml_cgraph* graph,
+                            const ggml_graph_cut::Segment& segment,
+                            const char* log_desc,
+                            ggml_backend_t backend = nullptr);
         void prune(const std::unordered_set<std::string>& keep_names);
         void clear() { tensors_.clear(); }
     };

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -688,36 +689,51 @@ struct LTX2Scheduler : SigmaScheduler {
             return sigmas;
         }
 
-        constexpr float base_shift_anchor = 1024.0f;
-        constexpr float max_shift_anchor  = 4096.0f;
-        float m                           = (max_shift - base_shift) / (max_shift_anchor - base_shift_anchor);
-        float b                           = base_shift - m * base_shift_anchor;
-        float sigma_shift                 = static_cast<float>(token_count) * m + b;
-        float exp_shift                   = std::exp(sigma_shift);
-        float target_terminal             = std::clamp(terminal, 0.0f, 0.99f);
+        constexpr double base_shift_anchor = 1024.0;
+        constexpr double max_shift_anchor  = 4096.0;
+        const double m                     = (static_cast<double>(max_shift) - base_shift) / (max_shift_anchor - base_shift_anchor);
+        const double b                     = base_shift - m * base_shift_anchor;
+        const double sigma_shift           = static_cast<double>(token_count) * m + b;
+        const double exp_shift             = std::exp(sigma_shift);
+        const float target_terminal        = std::clamp(terminal, 0.0f, 0.99f);
 
-        LOG_VERBOSE("LTX2 scheduler: tokens=%d, shift=%.4f, stretch=%d, terminal=%.4f", token_count, sigma_shift, stretch ? 1 : 0, target_terminal);
+        // The shift grows linearly with the token count, so exp(shift) is
+        // ~1e9 at 57600 tokens (2560x1440x121 frames) and every shifted sigma
+        // rounds to 1.0f. Work with 1 - sigma instead, which stays
+        // representable, and stretch by ratio so the schedule converges to
+        // the same curve as the shift saturates instead of collapsing to
+        // [1, ..., 1, 0]. Once exp(shift) overflows, 1 - sigma is
+        // proportional to 1/t - 1 and only that ratio matters for stretching.
+        std::vector<double> one_minus(n + 1, 0.0);
+        for (uint32_t i = 1; i < n; ++i) {
+            const double t     = 1.0 - static_cast<double>(i) / static_cast<double>(n);
+            const double inv_t = 1.0 / t - 1.0;
+            one_minus[i]       = std::isfinite(exp_shift) ? inv_t / (exp_shift + inv_t) : inv_t;
+        }
+        one_minus[n] = 1.0;
+
+        const bool do_stretch = stretch && n >= 2 && one_minus[n - 1] > 0.0;
+        if (!do_stretch && !std::isfinite(exp_shift)) {
+            std::fill(one_minus.begin() + 1, one_minus.begin() + n, 0.0);
+        }
 
         sigmas.reserve(n + 1);
         for (uint32_t i = 0; i <= n; ++i) {
-            float sigma = 1.0f - static_cast<float>(i) / static_cast<float>(n);
-            if (sigma != 0.0f) {
-                sigma = exp_shift / (exp_shift + (1.0f / sigma - 1.0f));
+            double value = one_minus[i];
+            if (do_stretch && i < n) {
+                value = (1.0 - static_cast<double>(target_terminal)) * value / one_minus[n - 1];
             }
-            sigmas.push_back(sigma);
+            sigmas.push_back(i == n ? 0.0f : static_cast<float>(1.0 - value));
         }
 
-        if (stretch && sigmas.size() > 2) {
-            float one_minus_last = 1.0f - sigmas[n - 1];
-            float scale_factor   = one_minus_last / (1.0f - target_terminal);
-            if (scale_factor > 1e-8f) {
-                for (uint32_t i = 0; i < n; ++i) {
-                    sigmas[i] = 1.0f - (1.0f - sigmas[i]) / scale_factor;
-                }
-            }
+        std::string sigma_list;
+        for (float sigma : sigmas) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%s%.4f", sigma_list.empty() ? "" : ", ", sigma);
+            sigma_list += buf;
         }
-
-        sigmas[n] = 0.0f;
+        LOG_VERBOSE("LTX2 scheduler: tokens=%d, shift=%.4f, stretch=%d, terminal=%.4f, sigmas=[%s]",
+                    token_count, sigma_shift, do_stretch ? 1 : 0, target_terminal, sigma_list.c_str());
         return sigmas;
     }
 };

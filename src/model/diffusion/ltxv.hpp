@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
+#include <limits>
 #include <memory>
 #include <string>
 #include <tuple>
@@ -14,19 +16,37 @@
 
 #include "model/common/block.hpp"
 #include "model/common/rope.hpp"
+#include "model/diffusion/dit.hpp"
 #include "model/diffusion/flux.hpp"
 #include "model/diffusion/model.hpp"
 #include "model_loader.h"
 
 namespace LTXV {
 
-    constexpr int LTXAV_GRAPH_SIZE = 102400;
+    constexpr int LTXAV_GRAPH_SIZE = 262144;
 
     __STATIC_INLINE__ ggml_tensor* rms_norm(ggml_context* ctx,
                                             ggml_tensor* x,
                                             float eps = 1e-6f) {
         return ggml_rms_norm(ctx, x, eps);
     }
+
+    // Token range of an activation [dim, tokens, 1] or of a per-token
+    // modulation [dim, 1, tokens]; broadcast modulations pass through.
+    __STATIC_INLINE__ ggml_tensor* token_range(ggml_context* ctx, ggml_tensor* t, int64_t n_tokens, int64_t start, int64_t count) {
+        if (t == nullptr || count >= n_tokens) {
+            return t;
+        }
+        if (t->ne[1] == n_tokens && t->ne[2] == 1) {
+            return ggml_view_3d(ctx, t, t->ne[0], count, 1, t->nb[1], t->nb[2], start * t->nb[1]);
+        }
+        if (t->ne[1] == 1 && t->ne[2] == n_tokens) {
+            return ggml_view_3d(ctx, t, t->ne[0], 1, count, t->nb[1], t->nb[2], start * t->nb[2]);
+        }
+        return t;
+    }
+
+    using DiT::token_chunk_size;
 
     __STATIC_INLINE__ ggml_tensor* align_token_modulation(ggml_context* ctx,
                                                           ggml_tensor* x,
@@ -77,6 +97,10 @@ namespace LTXV {
     }
 
     struct LTXAVConfig {
+        // Feed-forward token chunking inside each block: <0 automatic (about
+        // 256 MiB per f32 intermediate), 0 off, >0 tokens per range.
+        int64_t token_chunk = -1;
+
         int64_t in_channels                           = 128;
         int64_t out_channels                          = 128;
         int64_t hidden_size                           = 3840;
@@ -596,9 +620,9 @@ namespace LTXV {
             : embedding_dim(embedding_dim), embedding_coefficient(embedding_coefficient) {
             blocks["emb.timestep_embedder"] = std::make_shared<TimestepEmbedder>(embedding_dim);
             blocks["linear"]                = std::make_shared<Linear>(embedding_dim,
-                                                        embedding_coefficient * embedding_dim,
-                                                        true,
-                                                        true);
+                                                                       embedding_coefficient * embedding_dim,
+                                                                       true,
+                                                                       true);
         }
 
         std::pair<ggml_tensor*, ggml_tensor*> forward(GGMLRunnerContext* ctx,
@@ -654,9 +678,16 @@ namespace LTXV {
     };
 
     struct CrossAttention : public GGMLBlock {
+        static constexpr int64_t FLASH_ATTN_KV_SCALE_MIN_KEYS = 2048;
+        static constexpr float FLASH_ATTN_KV_SCALE            = 1.f / 128.f;
+
         int64_t heads;
         int64_t dim_head;
         bool rope_interleaved;
+        int64_t query_dim;
+        // Query token chunking: <0 automatic, 0 off, >0 tokens per range.
+        int64_t q_chunk        = -1;
+        bool q_chunk_disabled_ = false;
 
         CrossAttention(int64_t query_dim,
                        int64_t context_dim,
@@ -664,7 +695,7 @@ namespace LTXV {
                        int64_t dim_head,
                        bool apply_gated_attention = false,
                        bool rope_interleaved      = true)
-            : heads(heads), dim_head(dim_head), rope_interleaved(rope_interleaved) {
+            : heads(heads), dim_head(dim_head), rope_interleaved(rope_interleaved), query_dim(query_dim) {
             int64_t inner_dim = heads * dim_head;
             blocks["q_norm"]  = std::make_shared<RMSNorm>(inner_dim, 1e-5f);
             blocks["k_norm"]  = std::make_shared<RMSNorm>(inner_dim, 1e-5f);
@@ -694,21 +725,147 @@ namespace LTXV {
             auto k_norm   = std::dynamic_pointer_cast<RMSNorm>(blocks["k_norm"]);
             auto to_out_0 = std::dynamic_pointer_cast<Linear>(blocks["to_out.0"]);
 
-            auto q = to_q->forward(ctx, x);
             auto k = to_k->forward(ctx, context);
             auto v = to_v->forward(ctx, context);
-
-            q = q_norm->forward(ctx, q);
-            k = k_norm->forward(ctx, k);
-
-            if (pe != nullptr) {
-                if (k_pe == nullptr) {
-                    k_pe = pe;
-                }
-                q = apply_hidden_rope(ctx->ggml_ctx, q, pe, heads, dim_head, rope_interleaved);
-                k = apply_hidden_rope(ctx->ggml_ctx, k, k_pe, heads, dim_head, rope_interleaved);
+            k      = k_norm->forward(ctx, k);
+            if (pe != nullptr && k_pe == nullptr) {
+                k_pe = pe;
             }
 
+            // The CUDA flash-attention MMA kernel accumulates the unnormalized
+            // P*V sum in F16. With thousands of keys and flat attention (audio
+            // tokens attending every video token) it overflows to inf and the
+            // whole latent becomes NaN; observed above ~10k video tokens
+            // (640x480 with 38+ latent frames). Shrinking K/V keeps the
+            // accumulator in range; ggml_ext_attention_ext compensates.
+            float kv_scale = 1.f;
+            if (ctx->flash_attn_enabled && k->ne[1] > FLASH_ATTN_KV_SCALE_MIN_KEYS) {
+                kv_scale = FLASH_ATTN_KV_SCALE;
+            }
+
+            // Long query sequences: K and V are prepared once in the flash
+            // attention layout and the queries run by token ranges, so the
+            // projection, rope and attention temporaries of one range are
+            // released before the next (see gated_feed_forward for the stitching).
+            const int64_t n_q       = x->ne[1];
+            const int64_t inner_dim = heads * dim_head;
+            const int64_t chunk     = token_chunk_size(q_chunk, inner_dim * static_cast<int64_t>(sizeof(float)) * 10, n_q);
+            int64_t pe_per_token    = 0;
+            if (pe == nullptr) {
+                pe_per_token = 1;
+            } else if (pe->ne[3] == n_q * heads) {
+                pe_per_token = heads;
+            } else if (pe->ne[3] == n_q) {
+                pe_per_token = 1;
+            }
+            const int64_t lk       = k->ne[1];
+            int64_t k_pe_per_token = 0;
+            if (k_pe == nullptr) {
+                k_pe_per_token = 1;
+            } else if (k_pe->ne[3] == lk * heads) {
+                k_pe_per_token = heads;
+            } else if (k_pe->ne[3] == lk) {
+                k_pe_per_token = 1;
+            }
+            const bool chunked = !q_chunk_disabled_ && chunk < n_q && mask == nullptr &&
+                                 ctx->flash_attn_enabled && !ctx->sage_attn_enabled &&
+                                 x->type == GGML_TYPE_F32 && x->ne[2] == 1 && x->ne[3] == 1 &&
+                                 x->ne[0] == query_dim && pe_per_token > 0 && k_pe_per_token > 0 &&
+                                 k->ne[2] == 1 && k->ne[3] == 1;
+            bool k_roped = false;
+            if (chunked) {
+                ggml_context* g = ctx->ggml_ctx;
+                // Rope on K by token ranges too: its temporaries are several
+                // times the size of K and would otherwise set the block's peak.
+                if (k_pe != nullptr) {
+                    const int64_t k_chunk = token_chunk_size(q_chunk, inner_dim * static_cast<int64_t>(sizeof(float)) * 10, lk);
+                    if (k_chunk < lk) {
+                        DiT::TokenRangeWriter k_rope(g, ggml_cont(g, k));
+                        for (int64_t start = 0; start < lk; start += k_chunk) {
+                            const int64_t count = std::min(k_chunk, lk - start);
+                            auto k_c            = token_range(g, k, lk, start, count);
+                            auto kpe_c          = ggml_view_4d(g, k_pe, k_pe->ne[0], k_pe->ne[1], k_pe->ne[2], count * k_pe_per_token,
+                                                               k_pe->nb[1], k_pe->nb[2], k_pe->nb[3], start * k_pe_per_token * k_pe->nb[3]);
+                            auto r              = apply_hidden_rope(g, k_c, kpe_c, heads, dim_head, rope_interleaved);
+                            k_rope.write(r, start, count);
+                        }
+                        k = k_rope.finish();
+                    } else {
+                        k = apply_hidden_rope(g, k, k_pe, heads, dim_head, rope_interleaved);
+                    }
+                    k_roped = true;
+                }
+                // Scale and cast before the layout copy so the transposed copy is half size.
+                auto prepare_kv = [&](ggml_tensor* t) {
+                    if (kv_scale != 1.f) {
+                        t = ggml_ext_scale(g, t, kv_scale);
+                    }
+                    t       = ggml_cast(g, t, GGML_TYPE_F16);
+                    auto t4 = ggml_reshape_4d(g, t, dim_head, heads, lk, 1);
+                    t4      = ggml_cont(g, ggml_permute(g, t4, 0, 2, 1, 3));
+                    return ggml_reshape_3d(g, t4, dim_head, lk, heads);
+                };
+                auto k16            = prepare_kv(k);
+                auto v16            = prepare_kv(v);
+                const float scale   = 1.f / std::sqrt(static_cast<float>(dim_head));
+                DiT::TokenRangeWriter result(g, ggml_cont(g, x));
+                bool supported = true;
+                for (int64_t start = 0; start < n_q && supported; start += chunk) {
+                    const int64_t count = std::min(chunk, n_q - start);
+                    auto x_c            = token_range(g, x, n_q, start, count);
+                    auto q_c            = q_norm->forward(ctx, to_q->forward(ctx, x_c));
+                    if (pe != nullptr) {
+                        auto pe_c = ggml_view_4d(g, pe, pe->ne[0], pe->ne[1], pe->ne[2], count * pe_per_token,
+                                                 pe->nb[1], pe->nb[2], pe->nb[3], start * pe_per_token * pe->nb[3]);
+                        q_c       = apply_hidden_rope(g, q_c, pe_c, heads, dim_head, rope_interleaved);
+                    }
+                    auto q4  = ggml_reshape_4d(g, q_c, dim_head, heads, count, 1);
+                    q4       = ggml_cont(g, ggml_permute(g, q4, 0, 2, 1, 3));
+                    auto q3  = ggml_reshape_3d(g, q4, dim_head, count, heads);
+                    auto att = ggml_flash_attn_ext(g, q3, k16, v16, nullptr, scale / kv_scale, 0.f, 0.f);
+                    if (start == 0 && !ggml_backend_supports_op(ctx->backend, att)) {
+                        supported = false;
+                        break;
+                    }
+                    ggml_flash_attn_ext_set_prec(att, GGML_PREC_F32);
+                    if (kv_scale != 1.f) {
+                        att = ggml_ext_scale(g, att, 1.f / kv_scale);
+                    }
+                    auto out_c = ggml_reshape_3d(g, att, inner_dim, count, 1);
+                    if (blocks.count("to_gate_logits") > 0) {
+                        auto to_gate_logits = std::dynamic_pointer_cast<Linear>(blocks["to_gate_logits"]);
+                        auto gate_logits    = to_gate_logits->forward(ctx, x_c);
+                        auto gates          = ggml_sigmoid(g, gate_logits);
+                        gates               = ggml_ext_scale(g, gates, 2.0f, true);
+                        gates               = ggml_reshape_4d(g, gates, 1, heads, count, 1);
+                        auto out4           = ggml_reshape_4d(g, out_c, dim_head, heads, count, 1);
+                        gates               = ggml_repeat(g, gates, out4);
+                        out4                = ggml_mul(g, out4, gates);
+                        out_c               = ggml_reshape_3d(g, out4, inner_dim, count, 1);
+                    }
+                    auto o_c = to_out_0->forward(ctx, out_c);
+                    auto set = result.write(o_c, start, count);
+                    if (start == 0 && !ggml_backend_supports_op(ctx->backend, set)) {
+                        supported = false;
+                        break;
+                    }
+                }
+                if (supported) {
+                    return result.finish();
+                }
+                LOG_WARN("%s lacks flash attention or GGML_OP_SET support; LTX query chunking disabled",
+                         ggml_backend_name(ctx->backend));
+                q_chunk_disabled_ = true;
+            }
+
+            auto q = to_q->forward(ctx, x);
+            q      = q_norm->forward(ctx, q);
+            if (pe != nullptr) {
+                q = apply_hidden_rope(ctx->ggml_ctx, q, pe, heads, dim_head, rope_interleaved);
+                if (!k_roped) {
+                    k = apply_hidden_rope(ctx->ggml_ctx, k, k_pe, heads, dim_head, rope_interleaved);
+                }
+            }
             auto out = ggml_ext_attention_ext(ctx,
                                               q,
                                               k,
@@ -716,7 +873,8 @@ namespace LTXV {
                                               heads,
                                               mask,
                                               false,
-                                              ctx->flash_attn_enabled);
+                                              ctx->flash_attn_enabled,
+                                              kv_scale);
 
             if (blocks.count("to_gate_logits") > 0) {
                 auto to_gate_logits = std::dynamic_pointer_cast<Linear>(blocks["to_gate_logits"]);
@@ -1115,6 +1273,64 @@ namespace LTXV {
         int64_t v_dim;
         int64_t a_dim;
         bool cross_attention_adaln;
+        int64_t token_chunk        = -1;
+        bool token_chunk_disabled_ = false;
+
+        void set_token_chunk(int64_t value) {
+            token_chunk = value;
+            for (const char* name : {"attn1", "audio_attn1", "attn2", "audio_attn2", "audio_to_video_attn", "video_to_audio_attn"}) {
+                auto attention = std::dynamic_pointer_cast<CrossAttention>(blocks[name]);
+                if (attention) {
+                    attention->q_chunk = value;
+                }
+            }
+        }
+
+        // x + gate * ff(modulate(rms_norm(x))). Long sequences run the
+        // feed-forward by token ranges so the 4 x dim intermediates of one
+        // range are released before the next; the block's peak then stops
+        // scaling with the token count. Ranges are written into one tensor
+        // with chained in-place sets, which keeps the result a single
+        // contiguous tensor for the graph cut (its root is what gets cached).
+        ggml_tensor* gated_feed_forward(GGMLRunnerContext* ctx,
+                                        FeedForward* ff,
+                                        ggml_tensor* x,
+                                        ggml_tensor* shift,
+                                        ggml_tensor* scale,
+                                        ggml_tensor* gate,
+                                        int64_t dim) {
+            ggml_context* g        = ctx->ggml_ctx;
+            const int64_t n_tokens = x->ne[1];
+            const int64_t chunk    = token_chunk_size(token_chunk, dim * 4 * static_cast<int64_t>(sizeof(float)) * 2, n_tokens);
+            const bool chunked     = !token_chunk_disabled_ && chunk < n_tokens &&
+                                 x->type == GGML_TYPE_F32 && x->ne[2] == 1 && x->ne[3] == 1;
+            if (!chunked) {
+                auto h = rms_norm(g, x);
+                h      = LTXV::modulate(g, h, shift, scale);
+                h      = ff->forward(ctx, h);
+                return ggml_add(g, x, apply_gate(g, h, gate));
+            }
+            DiT::TokenRangeWriter out(g, ggml_cont(g, x));
+            for (int64_t start = 0; start < n_tokens; start += chunk) {
+                const int64_t count = std::min(chunk, n_tokens - start);
+                auto x_c            = token_range(g, x, n_tokens, start, count);
+                auto h              = rms_norm(g, x_c);
+                h                   = LTXV::modulate(g, h,
+                                                     token_range(g, shift, n_tokens, start, count),
+                                                     token_range(g, scale, n_tokens, start, count));
+                h                   = ff->forward(ctx, h);
+                h                   = apply_gate(g, h, token_range(g, gate, n_tokens, start, count));
+                auto y              = ggml_add(g, x_c, h);
+                auto set            = out.write(y, start, count);
+                if (start == 0 && !ggml_backend_supports_op(ctx->backend, set)) {
+                    LOG_WARN("%s does not support GGML_OP_SET; LTX feed-forward token chunking disabled",
+                             ggml_backend_name(ctx->backend));
+                    token_chunk_disabled_ = true;
+                    return gated_feed_forward(ctx, ff, x, shift, scale, gate, dim);
+                }
+            }
+            return out.finish();
+        }
 
         void init_params(ggml_context* ctx,
                          const String2TensorStorage& tensor_storage_map = {},
@@ -1174,14 +1390,18 @@ namespace LTXV {
             if (count < 0) {
                 count = coeff - start;
             }
-            auto t      = ggml_reshape_3d(ctx->ggml_ctx, timestep, dim, coeff, timestep->ne[1]);
-            auto s      = ggml_reshape_3d(ctx->ggml_ctx, table, dim, coeff, 1);
-            auto e      = ggml_new_tensor_3d(ctx->ggml_ctx, timestep->type, dim, coeff, timestep->ne[1]);
-            t           = ggml_repeat(ctx->ggml_ctx, t, e);
-            s           = ggml_repeat(ctx->ggml_ctx, s, e);
-            auto out    = ggml_add(ctx->ggml_ctx, s, t);
-            auto chunks = ggml_ext_chunk(ctx->ggml_ctx, out, static_cast<int>(coeff), 1);
-            return std::vector<ggml_tensor*>(chunks.begin() + start, chunks.begin() + start + count);
+            // With per-token timesteps (image conditioning) `timestep` is
+            // [dim * coeff, tokens], so the sum is token-sized. Broadcasting the
+            // table and adding only the requested coefficients (through strided
+            // views) keeps that temporary at count/coeff of the full table.
+            auto t = ggml_reshape_3d(ctx->ggml_ctx, timestep, dim, coeff, timestep->ne[1]);
+            auto s = ggml_reshape_3d(ctx->ggml_ctx, table, dim, coeff, 1);
+            if (start != 0 || count != coeff) {
+                t = ggml_view_3d(ctx->ggml_ctx, t, dim, count, t->ne[2], t->nb[1], t->nb[2], start * t->nb[1]);
+                s = ggml_view_3d(ctx->ggml_ctx, s, dim, count, 1, s->nb[1], s->nb[2], start * s->nb[1]);
+            }
+            auto out = ggml_add(ctx->ggml_ctx, t, s);
+            return ggml_ext_chunk(ctx->ggml_ctx, out, static_cast<int>(count), 1);
         }
 
         ggml_tensor* apply_text_cross_attention(GGMLRunnerContext* ctx,
@@ -1246,7 +1466,7 @@ namespace LTXV {
             bool run_a2v = run_ax;
             bool run_v2a = run_ax;
 
-            auto v_mods = get_ada_values(ctx, v_table, v_timestep, v_dim, cross_attention_adaln ? 9 : 6);
+            auto v_mods = get_ada_values(ctx, v_table, v_timestep, v_dim, cross_attention_adaln ? 9 : 6, 0, 3);
             auto v_norm = rms_norm(ctx->ggml_ctx, vx);
             v_norm      = LTXV::modulate(ctx->ggml_ctx, v_norm, v_mods[0], v_mods[1]);
             auto v_sa   = attn1->forward(ctx, v_norm, nullptr, self_attention_mask, v_pe);
@@ -1264,7 +1484,7 @@ namespace LTXV {
             vx          = ggml_add(ctx->ggml_ctx, vx, v_txt);
 
             if (run_ax) {
-                auto a_mods = get_ada_values(ctx, a_table, a_timestep, a_dim, cross_attention_adaln ? 9 : 6);
+                auto a_mods = get_ada_values(ctx, a_table, a_timestep, a_dim, cross_attention_adaln ? 9 : 6, 0, 3);
                 auto a_norm = rms_norm(ctx->ggml_ctx, ax);
                 a_norm      = LTXV::modulate(ctx->ggml_ctx, a_norm, a_mods[0], a_mods[1]);
                 auto a_sa   = audio_attn1->forward(ctx, a_norm, nullptr, nullptr, a_pe);
@@ -1287,8 +1507,8 @@ namespace LTXV {
                 if (run_a2v) {
                     auto a2v_audio_table = ggml_ext_slice(ctx->ggml_ctx, params["scale_shift_table_a2v_ca_audio"], 1, 0, 4);
                     auto a2v_video_table = ggml_ext_slice(ctx->ggml_ctx, params["scale_shift_table_a2v_ca_video"], 1, 0, 4);
-                    auto a2v_audio       = get_ada_values(ctx, a2v_audio_table, a_cross_scale_shift_timestep, a_dim, 4);
-                    auto a2v_video       = get_ada_values(ctx, a2v_video_table, v_cross_scale_shift_timestep, v_dim, 4);
+                    auto a2v_audio       = get_ada_values(ctx, a2v_audio_table, a_cross_scale_shift_timestep, a_dim, 4, 0, 2);
+                    auto a2v_video       = get_ada_values(ctx, a2v_video_table, v_cross_scale_shift_timestep, v_dim, 4, 0, 2);
                     auto vx_scaled       = LTXV::modulate(ctx->ggml_ctx, vx_norm3, a2v_video[1], a2v_video[0]);
                     auto ax_scaled       = LTXV::modulate(ctx->ggml_ctx, ax_norm3, a2v_audio[1], a2v_audio[0]);
                     auto a2v_out         = audio_to_video_attn->forward(ctx, vx_scaled, ax_scaled, nullptr, v_cross_pe, a_cross_pe);
@@ -1300,27 +1520,21 @@ namespace LTXV {
                 if (run_v2a) {
                     auto v2a_audio_table = ggml_ext_slice(ctx->ggml_ctx, params["scale_shift_table_a2v_ca_audio"], 1, 0, 4);
                     auto v2a_video_table = ggml_ext_slice(ctx->ggml_ctx, params["scale_shift_table_a2v_ca_video"], 1, 0, 4);
-                    auto v2a_audio       = get_ada_values(ctx, v2a_audio_table, a_cross_scale_shift_timestep, a_dim, 4);
-                    auto v2a_video       = get_ada_values(ctx, v2a_video_table, v_cross_scale_shift_timestep, v_dim, 4);
-                    auto ax_scaled       = LTXV::modulate(ctx->ggml_ctx, ax_norm3, v2a_audio[3], v2a_audio[2]);
-                    auto vx_scaled       = LTXV::modulate(ctx->ggml_ctx, vx_norm3, v2a_video[3], v2a_video[2]);
+                    auto v2a_audio       = get_ada_values(ctx, v2a_audio_table, a_cross_scale_shift_timestep, a_dim, 4, 2, 2);
+                    auto v2a_video       = get_ada_values(ctx, v2a_video_table, v_cross_scale_shift_timestep, v_dim, 4, 2, 2);
+                    auto ax_scaled       = LTXV::modulate(ctx->ggml_ctx, ax_norm3, v2a_audio[1], v2a_audio[0]);
+                    auto vx_scaled       = LTXV::modulate(ctx->ggml_ctx, vx_norm3, v2a_video[1], v2a_video[0]);
                     auto v2a_out         = video_to_audio_attn->forward(ctx, ax_scaled, vx_scaled, nullptr, a_cross_pe, v_cross_pe);
                     auto v2a_gate_table  = ggml_ext_slice(ctx->ggml_ctx, params["scale_shift_table_a2v_ca_audio"], 1, 4, 5);
                     auto v2a_gate        = get_ada_values(ctx, v2a_gate_table, a_cross_gate_timestep, a_dim, 1)[0];
                     ax                   = ggml_add(ctx->ggml_ctx, ax, apply_gate(ctx->ggml_ctx, v2a_out, v2a_gate));
                 }
                 auto a_ff_mods = get_ada_values(ctx, a_table, a_timestep, a_dim, cross_attention_adaln ? 9 : 6, 3, 3);
-                auto ax_scaled = rms_norm(ctx->ggml_ctx, ax);
-                ax_scaled      = LTXV::modulate(ctx->ggml_ctx, ax_scaled, a_ff_mods[0], a_ff_mods[1]);
-                auto a_ff_out  = audio_ff->forward(ctx, ax_scaled);
-                ax             = ggml_add(ctx->ggml_ctx, ax, apply_gate(ctx->ggml_ctx, a_ff_out, a_ff_mods[2]));
+                ax             = gated_feed_forward(ctx, audio_ff.get(), ax, a_ff_mods[0], a_ff_mods[1], a_ff_mods[2], a_dim);
             }
 
             auto v_ff_mods = get_ada_values(ctx, v_table, v_timestep, v_dim, cross_attention_adaln ? 9 : 6, 3, 3);
-            auto vx_scaled = rms_norm(ctx->ggml_ctx, vx);
-            vx_scaled      = LTXV::modulate(ctx->ggml_ctx, vx_scaled, v_ff_mods[0], v_ff_mods[1]);
-            auto v_ff_out  = ff->forward(ctx, vx_scaled);
-            vx             = ggml_add(ctx->ggml_ctx, vx, apply_gate(ctx->ggml_ctx, v_ff_out, v_ff_mods[2]));
+            vx             = gated_feed_forward(ctx, ff.get(), vx, v_ff_mods[0], v_ff_mods[1], v_ff_mods[2], v_dim);
 
             return {vx, ax};
         }
@@ -1402,19 +1616,21 @@ namespace LTXV {
             }
 
             for (int i = 0; i < config.num_layers; i++) {
-                blocks["transformer_blocks." + std::to_string(i)] = std::make_shared<BasicAVTransformerBlock>(config.hidden_size,
-                                                                                                              config.audio_hidden_size,
-                                                                                                              config.num_attention_heads,
-                                                                                                              config.audio_num_attention_heads,
-                                                                                                              config.attention_head_dim,
-                                                                                                              config.audio_attention_head_dim,
-                                                                                                              config.cross_attention_dim,
-                                                                                                              config.audio_cross_attention_dim,
-                                                                                                              config.self_attention_gated || config.cross_attention_gated,
-                                                                                                              config.cross_attention_adaln,
-                                                                                                              config.video_rope_interleaved,
-                                                                                                              config.ff_bias,
-                                                                                                              config.audio_ff_bias);
+                auto transformer_block = std::make_shared<BasicAVTransformerBlock>(config.hidden_size,
+                                                                                   config.audio_hidden_size,
+                                                                                   config.num_attention_heads,
+                                                                                   config.audio_num_attention_heads,
+                                                                                   config.attention_head_dim,
+                                                                                   config.audio_attention_head_dim,
+                                                                                   config.cross_attention_dim,
+                                                                                   config.audio_cross_attention_dim,
+                                                                                   config.self_attention_gated || config.cross_attention_gated,
+                                                                                   config.cross_attention_adaln,
+                                                                                   config.video_rope_interleaved,
+                                                                                   config.ff_bias,
+                                                                                   config.audio_ff_bias);
+                transformer_block->set_token_chunk(config.token_chunk);
+                blocks["transformer_blocks." + std::to_string(i)] = transformer_block;
             }
 
             blocks["norm_out"]       = std::make_shared<LayerNorm>(config.hidden_size, 1e-6f, false);
@@ -1687,8 +1903,31 @@ namespace LTXV {
                     ->forward(ctx, ggml_ext_scale(ctx->ggml_ctx, av_ca_audio_timestep, av_ca_factor))
                     .first;
 
-            sd::ggml_graph_cut::mark_graph_cut(vx, "ltxav.prelude", "vx");
-            sd::ggml_graph_cut::mark_graph_cut(ax, "ltxav.prelude", "ax");
+            // Everything the blocks share is cut here; otherwise each block
+            // segment recomputes the connectors and the per-token adaLN
+            // projections and keeps their weights resident for the whole run.
+            // Leaves keep their names: the runner binds inputs by name.
+            auto mark_prelude_cut = [](ggml_tensor* tensor, const char* output) {
+                if (tensor != nullptr && tensor->op != GGML_OP_NONE) {
+                    sd::ggml_graph_cut::mark_graph_cut(tensor, "ltxav.prelude", output);
+                }
+            };
+            mark_prelude_cut(vx, "vx");
+            mark_prelude_cut(ax, "ax");
+            mark_prelude_cut(v_context, "v_context");
+            if (contexts.second != nullptr) {
+                mark_prelude_cut(a_context, "a_context");
+            }
+            mark_prelude_cut(v_timestep_mod, "v_timestep_mod");
+            mark_prelude_cut(a_timestep_mod, "a_timestep_mod");
+            mark_prelude_cut(v_embedded_time, "v_embedded_time");
+            mark_prelude_cut(a_embedded_time, "a_embedded_time");
+            mark_prelude_cut(v_prompt_timestep_mod, "v_prompt_timestep_mod");
+            mark_prelude_cut(a_prompt_timestep_mod, "a_prompt_timestep_mod");
+            mark_prelude_cut(av_ca_video_scale_shift_timestep, "av_ca_video_scale_shift_timestep");
+            mark_prelude_cut(av_ca_audio_scale_shift_timestep, "av_ca_audio_scale_shift_timestep");
+            mark_prelude_cut(av_ca_a2v_gate_noise_timestep, "av_ca_a2v_gate_noise_timestep");
+            mark_prelude_cut(av_ca_v2a_gate_noise_timestep, "av_ca_v2a_gate_noise_timestep");
 
             for (int i = 0; i < config.num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<BasicAVTransformerBlock>(blocks["transformer_blocks." + std::to_string(i)]);
@@ -1746,13 +1985,29 @@ namespace LTXV {
         sd::Tensor<float> vx_input_cache;
         sd::Tensor<float> ax_input_cache;
 
+        static LTXAVConfig configure(LTXAVConfig config, const char* model_args) {
+            for (const auto& [key, value] : parse_key_value_args(model_args, "model arg")) {
+                if (key != "token_chunk") {
+                    continue;
+                }
+                config.token_chunk = DiT::parse_token_chunk_arg(value, "LTX", config.token_chunk);
+            }
+            return config;
+        }
+
         LTXAVRunner(ggml_backend_t backend,
                     const String2TensorStorage& tensor_storage_map      = {},
                     const std::string& prefix                           = "model.diffusion_model",
-                    std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
+                    std::shared_ptr<RunnerWeightManager> weight_manager = nullptr,
+                    const char* model_args                              = nullptr)
             : DiffusionModelRunner(backend, prefix, weight_manager),
-              config(LTXAVConfig::detect_from_weights(tensor_storage_map, prefix)),
+              config(configure(LTXAVConfig::detect_from_weights(tensor_storage_map, prefix), model_args)),
               model(config) {
+            if (config.token_chunk == 0) {
+                LOG_INFO("LTX feed-forward token chunking disabled");
+            } else if (config.token_chunk > 0) {
+                LOG_INFO("LTX feed-forward token chunking: %lld tokens per range", static_cast<long long>(config.token_chunk));
+            }
             model.init(params_ctx, tensor_storage_map, prefix);
         }
 

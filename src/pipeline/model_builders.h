@@ -32,6 +32,9 @@ namespace sd::model_builders {
         const String2TensorStorage& tensor_storage_map;
         SDBackendManager& backends;
         std::shared_ptr<DeviceResidencyManager> weight_manager;
+        // Builds the diffusion runner on this device instead of the DIFFUSION
+        // module's device (used for the CFG replica).
+        ggml_backend_t diffusion_backend_override = nullptr;
     };
 
     struct CoreRunners {

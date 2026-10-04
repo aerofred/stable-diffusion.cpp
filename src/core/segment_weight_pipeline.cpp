@@ -24,11 +24,15 @@ namespace sd {
         ggml_cgraph* graph,
         const ggml_graph_cut::Plan& plan,
         const std::unordered_set<const ggml_tensor*>& params,
-        bool enabled)
+        bool enabled,
+        const std::vector<ggml_backend_t>& segment_backends,
+        bool wrap_prefetch)
         : residency_manager_(residency_manager),
           compute_backend_(compute_backend),
           owner_id_(owner_id),
-          enabled_(enabled && residency_manager != nullptr) {
+          segment_backends_(segment_backends),
+          enabled_(enabled && residency_manager != nullptr),
+          wrap_prefetch_(wrap_prefetch) {
         segment_params_.resize(plan.segments.size());
         for (size_t segment_index = 0; segment_index < plan.segments.size(); ++segment_index) {
             std::unordered_set<ggml_tensor*> seen;
@@ -53,7 +57,45 @@ namespace sd {
                 return next;
             }
         }
+        if (wrap_prefetch_) {
+            for (size_t next = 0; next < segment_index && next < segment_params_.size(); ++next) {
+                if (!segment_params_[next].empty()) {
+                    return next;
+                }
+            }
+        }
         return SIZE_MAX;
+    }
+
+    void SegmentWeightPipeline::adopt_prefetch(size_t segment_index, std::vector<ggml_tensor*> params) {
+        if (!enabled_ || segment_index >= segment_params_.size() || params.empty()) {
+            clear();
+            return;
+        }
+        queued_params_     = std::move(params);
+        queued_segment_    = segment_index;
+        queued_cross_step_ = false;
+    }
+
+    void SegmentWeightPipeline::take_cross_step_prefetch(size_t* segment_index, std::vector<ggml_tensor*>* params) {
+        GGML_ASSERT(segment_index != nullptr && params != nullptr);
+        if (queued_segment_ == SIZE_MAX || !queued_cross_step_) {
+            *segment_index = SIZE_MAX;
+            params->clear();
+            return;
+        }
+        *segment_index = queued_segment_;
+        *params        = std::move(queued_params_);
+        queued_params_.clear();
+        queued_segment_    = SIZE_MAX;
+        queued_cross_step_ = false;
+    }
+
+    ggml_backend_t SegmentWeightPipeline::segment_backend(size_t segment_index) const {
+        if (segment_index < segment_backends_.size() && segment_backends_[segment_index] != nullptr) {
+            return segment_backends_[segment_index];
+        }
+        return compute_backend_;
     }
 
     std::vector<std::vector<ggml_tensor*>> SegmentWeightPipeline::preferred_eviction_order() const {
@@ -71,13 +113,16 @@ namespace sd {
         }
 
         auto manager = residency_manager_.lock();
-        if (manager == nullptr ||
-            !manager->activate_prefetched_params(owner_id_, queued_params_)) {
+        if (manager == nullptr) {
             disable();
             return;
         }
+        // A cancelled or stale prefetch falls back to synchronous staging for
+        // this segment only; later segments can still be prefetched.
+        manager->activate_prefetched_params(owner_id_, queued_params_);
         queued_params_.clear();
-        queued_segment_ = SIZE_MAX;
+        queued_segment_    = SIZE_MAX;
+        queued_cross_step_ = false;
     }
 
     bool SegmentWeightPipeline::ensure_segment_capacity(
@@ -103,18 +148,25 @@ namespace sd {
 
     bool SegmentWeightPipeline::segment_start(size_t segment_index, const std::function<bool()>& ensure_capacity) {
         GGML_ASSERT(pinned_params_.empty());
+        last_start_timing_ = {};
+        int64_t t0         = ggml_time_us();
         activate(segment_index);
+        int64_t t1                     = ggml_time_us();
+        last_start_timing_.activate_us = t1 - t0;
         if (!ensure_capacity()) {
             return false;
         }
-        auto manager = residency_manager_.lock();
+        int64_t t2                     = ggml_time_us();
+        last_start_timing_.capacity_us = t2 - t1;
+        auto manager                   = residency_manager_.lock();
         if (manager == nullptr) {
             return segment_params_[segment_index].empty();
         }
         if (!manager->prepare_params(segment_params_[segment_index])) {
             return false;
         }
-        pinned_params_ = segment_params_[segment_index];
+        last_start_timing_.prepare_us = ggml_time_us() - t2;
+        pinned_params_                = segment_params_[segment_index];
         return true;
     }
 
@@ -127,8 +179,8 @@ namespace sd {
 
     void SegmentWeightPipeline::enqueue_next(
         size_t segment_index,
-        const DeviceMemoryRequest& request) {
-        if (!enabled_ || queued_segment_ != SIZE_MAX) {
+        const std::vector<DeviceMemoryRequest>& requests) {
+        if (!enabled_ || queued_segment_ != SIZE_MAX || requests.empty()) {
             return;
         }
 
@@ -166,8 +218,16 @@ namespace sd {
             return;
         }
 
-        DeviceMemoryRequest backend_request        = request;
-        backend_request.compute_backend            = compute_backend_;
+        ggml_backend_t next_backend        = segment_backend(next_segment);
+        const DeviceMemoryRequest* request = &requests.front();
+        for (const auto& candidate : requests) {
+            if (candidate.compute_backend == next_backend) {
+                request = &candidate;
+                break;
+            }
+        }
+        DeviceMemoryRequest backend_request        = *request;
+        backend_request.compute_backend            = next_backend;
         backend_request.owner_id                   = owner_id_;
         std::vector<ggml_tensor*> protected_params = segment_params_[segment_index];
         protected_params.insert(protected_params.end(), params.begin(), params.end());
@@ -180,8 +240,9 @@ namespace sd {
         }
         switch (manager->prefetch_params(owner_id_, params)) {
             case WeightPrefetchResult::Scheduled:
-                queued_params_  = std::move(params);
-                queued_segment_ = next_segment;
+                queued_params_     = std::move(params);
+                queued_segment_    = next_segment;
+                queued_cross_step_ = next_segment <= segment_index;
                 return;
             case WeightPrefetchResult::AlreadyResident:
                 return;
@@ -196,10 +257,15 @@ namespace sd {
     }
 
     void SegmentWeightPipeline::clear() {
-        if (auto manager = residency_manager_.lock()) {
-            manager->clear_prefetched_params(owner_id_);
+        // A prefetch handed to the runner (take_cross_step_prefetch) stays queued
+        // in the manager for the next graph.
+        if (queued_segment_ != SIZE_MAX) {
+            if (auto manager = residency_manager_.lock()) {
+                manager->clear_prefetched_params(owner_id_);
+            }
         }
         queued_params_.clear();
-        queued_segment_ = SIZE_MAX;
+        queued_segment_    = SIZE_MAX;
+        queued_cross_step_ = false;
     }
 }

@@ -39,10 +39,13 @@ struct DeviceMemoryRequest {
 struct DeviceResidencyManager {
     virtual ~DeviceResidencyManager() = default;
 
-    virtual bool segmented_compute_enabled() const                                          = 0;
-    virtual bool prefetch_enabled() const                                                   = 0;
-    virtual void set_workspace_reclaimer(uintptr_t owner_id, std::function<bool()> reclaim) = 0;
-    virtual void remove_runtime_owner(uintptr_t owner_id)                                   = 0;
+    virtual bool segmented_compute_enabled() const = 0;
+    virtual bool prefetch_enabled() const          = 0;
+    // The reclaimer receives the device under pressure and returns false when
+    // the owner holds nothing there; runners on other devices may be computing
+    // concurrently and must not be touched.
+    virtual void set_workspace_reclaimer(uintptr_t owner_id, std::function<bool(ggml_backend_t)> reclaim) = 0;
+    virtual void remove_runtime_owner(uintptr_t owner_id)                                                 = 0;
     // Capacity requests select their backend's weights; protection spans all backends.
     virtual bool fits_compute_backend_capacity(const DeviceMemoryRequest& request,
                                                const std::vector<ggml_tensor*>& required_params) const = 0;
@@ -68,6 +71,9 @@ struct DeviceResidencyManager {
     virtual bool activate_prefetched_params(uintptr_t owner_id,
                                             const std::vector<ggml_tensor*>& tensors) = 0;
     virtual void clear_prefetched_params(uintptr_t owner_id)                          = 0;
+    // Frees device memory the manager keeps only as an optimization (pooled
+    // staging buffers); called before a runner allocates a larger workspace.
+    virtual void trim_reclaimable_memory(ggml_backend_t compute_backend) { (void)compute_backend; }
 };
 
 // Transitional alias for model constructors that have not yet adopted the

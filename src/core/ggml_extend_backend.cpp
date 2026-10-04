@@ -96,6 +96,10 @@ static bool parse_backend_module(const std::string& raw_name, SDBackendModule* m
         *module = SDBackendModule::AUDIO_ENCODER;
         return true;
     }
+    if (name == "cfg" || name == "uncond" || name == "cfgdiffusion" || name == "unconddiffusion") {
+        *module = SDBackendModule::CFG;
+        return true;
+    }
     return false;
 }
 
@@ -877,6 +881,10 @@ bool SDBackendManager::init(const char* backend_spec,
     return validate(error);
 }
 
+bool SDBackendManager::has_runtime_assignment(SDBackendModule module) const {
+    return runtime_assignment_.module_names.count(module) != 0;
+}
+
 SDSplitMode SDBackendManager::split_mode(SDBackendModule module) const {
     return lower_copy(trim_copy(split_mode_assignment_.get(module))) == "row" ? SDSplitMode::ROW
                                                                               : SDSplitMode::LAYER;
@@ -1061,6 +1069,8 @@ const char* sd_backend_module_name(SDBackendModule module) {
             return "detector";
         case SDBackendModule::AUDIO_ENCODER:
             return "audio_encoder";
+        case SDBackendModule::CFG:
+            return "cfg";
     }
     return "unknown";
 }

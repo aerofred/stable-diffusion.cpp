@@ -66,6 +66,9 @@ public:
     std::shared_ptr<FrozenCLIPVisionEmbedder> clip_vision;  // for svd or wan2.1 i2v
     std::shared_ptr<DiffusionModelRunner> diffusion_model;
     std::shared_ptr<DiffusionModelRunner> high_noise_diffusion_model;
+    // Same weights as diffusion_model on another device; runs the unconditional
+    // CFG pass concurrently with the conditional one.
+    std::shared_ptr<DiffusionModelRunner> cfg_diffusion_model;
     std::shared_ptr<VAE> first_stage_model;
     std::shared_ptr<VAE> preview_vae;
     std::shared_ptr<AudioVAERunner> audio_vae_model;
@@ -100,6 +103,7 @@ public:
     std::string backend_spec;
     std::string params_backend_spec;
     std::string split_mode_spec;
+    std::string split_ratio_spec;
     bool auto_fit_enabled = false;
 
     bool diffusion_conv_direct = false;
@@ -326,6 +330,8 @@ public:
     sd::model_builders::Context model_build_context();
 
     bool build_core_runners();
+
+    bool build_cfg_diffusion_runner();
 
     bool build_vae_runners();
 
