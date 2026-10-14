@@ -572,21 +572,22 @@ namespace LTXV {
         return build_rope_matrix_from_frequencies(freqs, dim);
     }
 
-    __STATIC_INLINE__ ggml_tensor* apply_hidden_rope(ggml_context* ctx,
+    __STATIC_INLINE__ ggml_tensor* apply_hidden_rope(GGMLRunnerContext* runner_ctx,
                                                      ggml_tensor* x,
                                                      ggml_tensor* pe,
                                                      int64_t heads,
                                                      int64_t dim_head,
                                                      bool rope_interleaved) {
+        auto ctx = runner_ctx->ggml_ctx;
         GGML_ASSERT(x->ne[0] == heads * dim_head);
         auto x4 = ggml_reshape_4d(ctx, x, dim_head, heads, x->ne[1], x->ne[2]);
         if (pe != nullptr && pe->ne[3] == x->ne[1] * heads) {
             auto x_flat   = ggml_reshape_4d(ctx, x4, dim_head, 1, x->ne[1] * heads, x->ne[2]);
-            auto out_flat = Rope::apply_rope(ctx, x_flat, pe, rope_interleaved);
+            auto out_flat = Rope::apply_rope(runner_ctx, x_flat, pe, rope_interleaved);
             auto out4     = ggml_reshape_4d(ctx, out_flat, dim_head, heads, x->ne[1], x->ne[2]);
             return ggml_reshape_3d(ctx, out4, heads * dim_head, x->ne[1], x->ne[2]);
         }
-        return Rope::apply_rope(ctx, x4, pe, rope_interleaved);
+        return Rope::apply_rope(runner_ctx, x4, pe, rope_interleaved);
     }
 
     struct TimestepEmbedder : public GGMLBlock {
@@ -786,12 +787,12 @@ namespace LTXV {
                             auto k_c            = token_range(g, k, lk, start, count);
                             auto kpe_c          = ggml_view_4d(g, k_pe, k_pe->ne[0], k_pe->ne[1], k_pe->ne[2], count * k_pe_per_token,
                                                                k_pe->nb[1], k_pe->nb[2], k_pe->nb[3], start * k_pe_per_token * k_pe->nb[3]);
-                            auto r              = apply_hidden_rope(g, k_c, kpe_c, heads, dim_head, rope_interleaved);
+                            auto r              = apply_hidden_rope(ctx, k_c, kpe_c, heads, dim_head, rope_interleaved);
                             k_rope.write(r, start, count);
                         }
                         k = k_rope.finish();
                     } else {
-                        k = apply_hidden_rope(g, k, k_pe, heads, dim_head, rope_interleaved);
+                        k = apply_hidden_rope(ctx, k, k_pe, heads, dim_head, rope_interleaved);
                     }
                     k_roped = true;
                 }
@@ -817,7 +818,7 @@ namespace LTXV {
                     if (pe != nullptr) {
                         auto pe_c = ggml_view_4d(g, pe, pe->ne[0], pe->ne[1], pe->ne[2], count * pe_per_token,
                                                  pe->nb[1], pe->nb[2], pe->nb[3], start * pe_per_token * pe->nb[3]);
-                        q_c       = apply_hidden_rope(g, q_c, pe_c, heads, dim_head, rope_interleaved);
+                        q_c       = apply_hidden_rope(ctx, q_c, pe_c, heads, dim_head, rope_interleaved);
                     }
                     auto q4  = ggml_reshape_4d(g, q_c, dim_head, heads, count, 1);
                     q4       = ggml_cont(g, ggml_permute(g, q4, 0, 2, 1, 3));
@@ -861,9 +862,9 @@ namespace LTXV {
             auto q = to_q->forward(ctx, x);
             q      = q_norm->forward(ctx, q);
             if (pe != nullptr) {
-                q = apply_hidden_rope(ctx->ggml_ctx, q, pe, heads, dim_head, rope_interleaved);
+                q = apply_hidden_rope(ctx, q, pe, heads, dim_head, rope_interleaved);
                 if (!k_roped) {
-                    k = apply_hidden_rope(ctx->ggml_ctx, k, k_pe, heads, dim_head, rope_interleaved);
+                    k = apply_hidden_rope(ctx, k, k_pe, heads, dim_head, rope_interleaved);
                 }
             }
             auto out = ggml_ext_attention_ext(ctx,

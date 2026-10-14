@@ -696,9 +696,9 @@ int main(int argc, const char* argv[]) {
 
     LOG_VERBOSE("version: %s", version_string().c_str());
     LOG_VERBOSE("%s", sd_get_system_info());
-    LOG_VERBOSE("%s", cli_params.to_string().c_str());
-    LOG_VERBOSE("%s", ctx_params.to_string().c_str());
-    LOG_VERBOSE("%s", gen_params.to_string().c_str());
+    LOG_DEBUG("%s", cli_params.to_string().c_str());
+    LOG_DEBUG("%s", ctx_params.to_string().c_str());
+    LOG_DEBUG("%s", gen_params.to_string().c_str());
 
     if (!cli_params.imatrix_out.empty()) {
         if (fs::exists(cli_params.imatrix_out) &&
@@ -716,6 +716,15 @@ int main(int argc, const char* argv[]) {
     }
 
     if (cli_params.mode == CONVERT) {
+        std::vector<sd_lora_t> loras;
+        loras.reserve(gen_params.lora_map.size() + gen_params.high_noise_lora_map.size());
+        for (const auto& [path, multiplier] : gen_params.lora_map) {
+            loras.push_back({false, multiplier, path.c_str()});
+        }
+        for (const auto& [path, multiplier] : gen_params.high_noise_lora_map) {
+            loras.push_back({true, multiplier, path.c_str()});
+        }
+
         bool success = convert_with_components(ctx_params.model_path.c_str(),
                                                ctx_params.clip_l_path.c_str(),
                                                ctx_params.clip_g_path.c_str(),
@@ -726,7 +735,9 @@ int main(int argc, const char* argv[]) {
                                                ctx_params.wtype,
                                                ctx_params.tensor_type_rules.c_str(),
                                                cli_params.convert_name,
-                                               ctx_params.n_threads);
+                                               ctx_params.n_threads,
+                                               loras.empty() ? nullptr : loras.data(),
+                                               (int)loras.size());
         if (!success) {
             LOG_ERROR("convert '%s'/'%s' to '%s' failed",
                       ctx_params.model_path.c_str(),

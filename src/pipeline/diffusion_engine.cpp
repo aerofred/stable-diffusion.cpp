@@ -19,6 +19,8 @@
 #include "core/ggml_runner.h"
 #include "core/ggml_tensor_utils.h"
 #include "core/layer_split_partition.h"
+#include "core/probe/conv_direct.h"
+#include "core/probe/flash_attn.h"
 #include "model.h"
 
 #include "core/rng.hpp"
@@ -108,6 +110,8 @@ const char* model_version_to_str[] = {
     "ESRGAN",
     "PixArt",
     "Ming-Image",
+    "Z-Image L2P",
+    "Iris-3B",
 };
 
 static_assert(VERSION_COUNT == sizeof(model_version_to_str) / sizeof(model_version_to_str[0]),
@@ -956,6 +960,21 @@ bool StableDiffusionGGML::init(const sd_ctx_params_t* sd_ctx_params) {
         LOG_ERROR("conditioning_cache_size must be non-negative");
         return false;
     }
+    const std::string flash_mode = SAFE_STR(sd_ctx_params->flash_attn_mode);
+    std::string flash_error;
+    if (!sd_parse_flash_attention_assignment(flash_mode, &flash_attn_assignment, &flash_error)) {
+        LOG_ERROR("invalid flash_attn_mode '%s': %s", flash_mode.c_str(), flash_error.c_str());
+        return false;
+    }
+    const std::string conv_mode = SAFE_STR(sd_ctx_params->conv_direct_mode);
+    std::string conv_error;
+    if (!sd_parse_conv_direct_assignment(conv_mode, &conv_direct_assignment, &conv_error)) {
+        LOG_ERROR("invalid conv_direct_mode '%s': %s", conv_mode.c_str(), conv_error.c_str());
+        return false;
+    }
+    flash_attn_by_backend.clear();
+    conv2d_direct_by_backend.clear();
+    conv3d_direct_by_backend.clear();
     conditioning_cache_->set_capacity(static_cast<size_t>(sd_ctx_params->conditioning_cache_size));
     auto configuration = std::make_unique<ModelConfig>(*sd_ctx_params);
     n_threads          = sd_ctx_params->n_threads;
@@ -1228,36 +1247,124 @@ bool StableDiffusionGGML::build_extension_runners() {
     return true;
 }
 
+bool StableDiffusionGGML::flash_attention_for(SDBackendModule module) {
+    const auto& params     = config_->params;
+    const std::string mode = flash_attn_assignment.get(module);
+    if (mode == "on") {
+        return true;
+    }
+    if (mode == "off") {
+        return false;
+    }
+    if (strlen(SAFE_STR(params.flash_attn_mode)) == 0) {
+        if (params.flash_attn) {
+            return true;
+        }
+        if (params.diffusion_flash_attn) {
+            return module == SDBackendModule::DIFFUSION;
+        }
+    }
+    auto backends    = backend_manager.runtime_backends(module);
+    bool enabled     = !backends.empty();
+    bool any_enabled = false;
+    for (auto backend : backends) {
+        auto it = flash_attn_by_backend.find(backend);
+        if (it == flash_attn_by_backend.end()) {
+            it = flash_attn_by_backend.emplace(backend, sd_probe_flash_attention(backend, n_threads)).first;
+        }
+        enabled     = enabled && it->second;
+        any_enabled = any_enabled || it->second;
+    }
+    if (any_enabled && !enabled) {
+        LOG_INFO("flash attention auto: %s -> off (compute devices disagree)", sd_backend_module_name(module));
+    }
+    return enabled;
+}
+
+bool StableDiffusionGGML::conv_direct_for(SDBackendModule module, bool conv3d) {
+    const auto& params     = config_->params;
+    const std::string mode = conv_direct_assignment.get(module);
+    if (mode == "on" || mode == "off") {
+        return mode == "on";
+    }
+    if (strlen(SAFE_STR(params.conv_direct_mode)) == 0 &&
+        (module == SDBackendModule::VAE ? params.vae_conv_direct : params.diffusion_conv_direct)) {
+        return true;
+    }
+    auto& by_backend = conv3d ? conv3d_direct_by_backend : conv2d_direct_by_backend;
+    auto backends    = backend_manager.runtime_backends(module);
+    bool enabled     = !backends.empty();
+    bool any_enabled = false;
+    for (auto backend : backends) {
+        auto it = by_backend.find(backend);
+        if (it == by_backend.end()) {
+            it = by_backend.emplace(backend, sd_probe_conv_direct(backend, conv3d)).first;
+        }
+        enabled     = enabled && it->second;
+        any_enabled = any_enabled || it->second;
+    }
+    if (any_enabled && !enabled) {
+        LOG_INFO("conv%dd direct auto: %s -> off (compute devices disagree)", conv3d ? 3 : 2, sd_backend_module_name(module));
+    }
+    return enabled;
+}
+
 bool StableDiffusionGGML::validate_and_load_runners() {
     const auto* sd_ctx_params   = &config_->params;
     const bool use_tae          = uses_tae();
     const bool tae_preview_only = this->tae_preview_only();
-    if (sd_ctx_params->flash_attn) {
-        LOG_INFO("Using flash attention");
-        cond_stage_model->set_flash_attention_enabled(true);
-        if (clip_vision) {
-            clip_vision->set_flash_attention_enabled(true);
-        }
+    cond_stage_model->set_flash_attention_enabled(flash_attention_for(SDBackendModule::TE));
+    if (clip_vision) {
+        clip_vision->set_flash_attention_enabled(flash_attention_for(SDBackendModule::CLIP_VISION));
+    }
+    if (first_stage_model || preview_vae || audio_vae_model) {
+        const bool enabled = flash_attention_for(SDBackendModule::VAE);
         if (first_stage_model) {
-            first_stage_model->set_flash_attention_enabled(true);
+            first_stage_model->set_flash_attention_enabled(enabled);
         }
         if (preview_vae) {
-            preview_vae->set_flash_attention_enabled(true);
+            preview_vae->set_flash_attention_enabled(enabled);
+        }
+        if (audio_vae_model) {
+            audio_vae_model->set_flash_attention_enabled(enabled);
         }
     }
-
-    if (sd_ctx_params->flash_attn || sd_ctx_params->diffusion_flash_attn) {
-        LOG_INFO("Using flash attention in the diffusion model");
-        diffusion_model->set_flash_attention_enabled(true);
-        if (high_noise_diffusion_model) {
-            high_noise_diffusion_model->set_flash_attention_enabled(true);
-        }
-        if (cfg_diffusion_model) {
-            cfg_diffusion_model->set_flash_attention_enabled(true);
-        }
+    const bool diffusion_fa = flash_attention_for(SDBackendModule::DIFFUSION);
+    diffusion_model->set_flash_attention_enabled(diffusion_fa);
+    if (high_noise_diffusion_model) {
+        high_noise_diffusion_model->set_flash_attention_enabled(diffusion_fa);
+    }
+    if (cfg_diffusion_model) {
+        cfg_diffusion_model->set_flash_attention_enabled(diffusion_fa);
+    }
+    if (ip_adapter) {
+        ip_adapter->set_flash_attention_enabled(diffusion_fa);
+    }
+    if (control_net) {
+        control_net->set_flash_attention_enabled(flash_attention_for(SDBackendModule::CONTROL_NET));
+    }
+    if (audio_encoder) {
+        audio_encoder->set_flash_attention_enabled(flash_attention_for(SDBackendModule::AUDIO_ENCODER));
     }
     if (sd_ctx_params->sage_attn && !set_sage_attention_enabled(true)) {
         return false;
+    }
+    const auto set_conv_direct = [this](SDBackendModule module, const std::vector<GGMLRunner*>& runners) {
+        const bool conv2d = conv_direct_for(module, false);
+        const bool conv3d = conv_direct_for(module, true);
+        for (auto runner : runners) {
+            if (runner != nullptr) {
+                runner->set_conv2d_direct_enabled(conv2d);
+                runner->set_conv3d_direct_enabled(conv3d);
+            }
+        }
+    };
+    set_conv_direct(SDBackendModule::DIFFUSION, {diffusion_model.get(), high_noise_diffusion_model.get(), cfg_diffusion_model.get()});
+    if (first_stage_model || preview_vae || audio_vae_model) {
+        set_conv_direct(SDBackendModule::VAE, {first_stage_model.get(), preview_vae.get(), audio_vae_model.get()});
+    }
+    if (control_net) {
+        set_conv_direct(SDBackendModule::CONTROL_NET, {control_net.get()});
     }
     LOG_VERBOSE("validating model metadata");
 
@@ -1427,11 +1534,13 @@ bool StableDiffusionGGML::build_denoiser() {
                    sd_version_is_anima(version) ||
                    sd_version_is_ernie_image(version) ||
                    sd_version_is_z_image(version) ||
+                   sd_version_is_z_image_l2p(version) ||
                    version == VERSION_MING_IMAGE ||
                    sd_version_is_llada_image(version) ||
                    sd_version_is_boogu_image(version) ||
                    sd_version_is_pid(version) ||
-                   sd_version_is_ideogram4(version)) {
+                   sd_version_is_ideogram4(version) ||
+                   version == VERSION_IRIS) {
             pred_type = FLOW_PRED;
             if (sd_version_is_wan(version)) {
                 default_flow_shift = 5.f;
@@ -1439,7 +1548,7 @@ bool StableDiffusionGGML::build_denoiser() {
                 default_flow_shift = 7.f;
             } else if (sd_version_is_minimax_h3(version)) {
                 default_flow_shift = 12.f;
-            } else if (sd_version_is_ernie_image(version)) {
+            } else if (sd_version_is_ernie_image(version) || version == VERSION_IRIS) {
                 default_flow_shift = 4.f;
             } else if (sd_version_is_pid(version)) {
                 default_flow_shift = 1.5f;
@@ -1575,7 +1684,7 @@ bool StableDiffusionGGML::build_runners(const RunnerGroups& groups) {
     LOG_INFO("Diffusion model weight type stat: %s", wtype_stat_to_str(diffusion_model_wtype_stat).c_str());
     LOG_INFO("VAE weight type stat:             %s", wtype_stat_to_str(vae_wtype_stat).c_str());
 
-    LOG_VERBOSE("ggml tensor size = %d bytes", (int)sizeof(ggml_tensor));
+    LOG_DEBUG("ggml tensor size = %d bytes", (int)sizeof(ggml_tensor));
 
     configure_weight_loading();
     for (auto group : groups) {
@@ -2229,7 +2338,7 @@ std::vector<float> StableDiffusionGGML::prepare_sample_timesteps(float sigma,
     if (version == VERSION_HIDREAM_O1) {
         return std::vector<float>{1.0f - (t / static_cast<float>(TIMESTEPS))};
     }
-    if (sd_version_is_z_image(version) || sd_version_is_ideogram4(version) || version == VERSION_MING_IMAGE) {
+    if (sd_version_is_z_image(version) || sd_version_is_z_image_l2p(version) || sd_version_is_ideogram4(version) || version == VERSION_MING_IMAGE) {
         return std::vector<float>{1000.f - t};
     }
     return std::vector<float>{t};
@@ -2278,6 +2387,27 @@ void StableDiffusionGGML::report_sample_progress(int step,
             *last_progress_us = now;
         }
     }
+}
+
+static sd::Tensor<float> batch_two_condition_tensors(const sd::Tensor<float>& a, const sd::Tensor<float>& b) {
+    if (a.empty() || b.empty() || a.dim() != b.dim()) {
+        return {};
+    }
+    if (a.dim() == 1) {
+        if (a.shape() != b.shape()) {
+            return {};
+        }
+        auto batched = sd::ops::concat(a, b, 0);
+        batched.reshape_({a.shape()[0], 2});
+        return batched;
+    }
+    const int64_t batch_dim = a.dim() - 1;
+    for (int64_t d = 0; d < batch_dim; d++) {
+        if (a.shape()[d] != b.shape()[d]) {
+            return {};
+        }
+    }
+    return sd::ops::concat(a, b, static_cast<size_t>(batch_dim));
 }
 
 void StableDiffusionGGML::compute_sample_controls(const sd::Tensor<float>& control_image,
@@ -2429,7 +2559,8 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
         noise *= eta;
     }
 
-    int64_t last_progress_us     = ggml_time_us();
+    int64_t last_progress_us = ggml_time_us();
+    sd_begin_preview_pass(static_cast<int>(steps));
     SamplePreviewContext preview = prepare_sample_preview_context();
 
     sd::Tensor<float> processed_init_latent       = denoiser->process_latent_in(init_latent);
@@ -2661,6 +2792,57 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
             return output_opt;
         };
 
+        auto run_batched_condition = [&](const SDCondition& condition,
+                                         const sd::Tensor<float>* c_concat_override) -> sd::Tensor<float> {
+            const sd::Tensor<float>& condition_concat =
+                c_concat_override != nullptr ? *c_concat_override : condition.c_concat;
+
+            sd::Tensor<float> batched_context = batch_two_condition_tensors(condition.c_crossattn, uncond.c_crossattn);
+            sd::Tensor<float> batched_y       = batch_two_condition_tensors(condition.c_vector, uncond.c_vector);
+            sd::Tensor<float> batched_concat  = batch_two_condition_tensors(condition_concat, uncond.c_concat);
+            if (!condition.c_crossattn.empty() && batched_context.empty()) {
+                return {};
+            }
+            if ((!condition.c_vector.empty() || !uncond.c_vector.empty()) && batched_y.empty()) {
+                return {};
+            }
+            if ((!condition_concat.empty() || !uncond.c_concat.empty()) && batched_concat.empty()) {
+                return {};
+            }
+
+            std::vector<sd::Tensor<float>> uncond_controls;
+            compute_sample_controls(control_image, noised_input, timesteps_tensor, uncond, &uncond_controls);
+            if (controls.size() != uncond_controls.size()) {
+                return {};
+            }
+            std::vector<sd::Tensor<float>> batched_controls;
+            batched_controls.reserve(controls.size());
+            for (size_t i = 0; i < controls.size(); i++) {
+                sd::Tensor<float> batched_control = batch_two_condition_tensors(controls[i], uncond_controls[i]);
+                if (batched_control.empty()) {
+                    return {};
+                }
+                batched_controls.push_back(std::move(batched_control));
+            }
+
+            sd::Tensor<float> batched_x =
+                sd::ops::concat(noised_input, noised_input, static_cast<size_t>(noised_input.dim() - 1));
+
+            DiffusionParams batched_params = base_diffusion_params;
+            batched_params.x               = &batched_x;
+            batched_params.context         = batched_context.empty() ? nullptr : &batched_context;
+            batched_params.c_concat        = batched_concat.empty() ? nullptr : &batched_concat;
+            batched_params.y               = batched_y.empty() ? nullptr : &batched_y;
+            batched_params.ref_latents     = nullptr;
+            batched_params.extra           = UNetDiffusionExtra{1, &batched_controls, control_strength};
+
+            sd::Tensor<float> output = work_diffusion_model->compute(n_threads, batched_params);
+            if (output.empty()) {
+                LOG_ERROR("batched diffusion model compute failed");
+            }
+            return output;
+        };
+
         const SDCondition* positive_condition      = &cond;
         const sd::Tensor<float>* c_concat_override = nullptr;
         for (const auto& extension : generation_extensions) {
@@ -2705,10 +2887,38 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
             LOG_VERBOSE("Skipping layers at uncond step %d\n", step);
             uncond_skip_layers = &skip_layer_guidance.layers();
         }
+
+        const bool batch_cfg_ok = config_->params.batched_cfg &&
+                                  sd_version_is_unet(version) &&
+                                  !uncond.empty() &&
+                                  img_uncond.empty() &&
+                                  !skip_uncond &&
+                                  !cache_runtime.ucache_enabled() &&
+                                  !(is_skiplayer_step && slg_uncond) &&
+                                  ip_adapter_tokens.empty() &&
+                                  ip_adapter_uncond_tokens.empty() &&
+                                  !config_->animatediff_loaded &&
+                                  (noised_input.dim() < 4 || noised_input.shape()[3] <= 1) &&
+                                  std::none_of(generation_extensions.begin(),
+                                               generation_extensions.end(),
+                                               [](const std::shared_ptr<GenerationExtension>& extension) {
+                                                   return extension->is_enabled();
+                                               });
+
+        if (batch_cfg_ok) {
+            sd::Tensor<float> batched_out = run_batched_condition(*positive_condition, c_concat_override);
+            if (!batched_out.empty() && batched_out.dim() >= 4 && batched_out.shape()[3] == 2) {
+                auto parts = sd::ops::chunk(batched_out, 2, 3);
+                cond_out   = std::move(parts[0]);
+                uncond_out = std::move(parts[1]);
+            }
+        }
+
         // The replica runs the unconditional pass on its own device while the
         // main device runs the conditional one. Features that share per-step
         // state between the two passes keep the sequential path.
-        const bool parallel_cfg = cfg_diffusion_model != nullptr &&
+        const bool parallel_cfg = cond_out.empty() &&
+                                  cfg_diffusion_model != nullptr &&
                                   work_diffusion_model == diffusion_model &&
                                   !uncond.empty() && !skip_uncond &&
                                   cache_runtime.mode == sd_sample::SampleCacheMode::NONE &&
@@ -2740,12 +2950,14 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
                 return {};
             }
         } else {
-            cond_out = run_condition(work_diffusion_model, *positive_condition, c_concat_override);
             if (cond_out.empty()) {
-                return {};
+                cond_out = run_condition(work_diffusion_model, *positive_condition, c_concat_override);
+                if (cond_out.empty()) {
+                    return {};
+                }
             }
 
-            if (!uncond.empty()) {
+            if (uncond_out.empty() && !uncond.empty()) {
                 if (!skip_uncond) {
                     uncond_out = run_condition(work_diffusion_model,
                                                uncond,
@@ -2863,6 +3075,8 @@ int StableDiffusionGGML::get_diffusion_model_down_factor() {
     if (sd_version_is_dit(version)) {
         if (sd_version_is_sensenova_u1(version)) {
             down_factor = 32;
+        } else if (sd_version_is_z_image_l2p(version) || version == VERSION_IRIS) {
+            down_factor = 16;
         } else if (version == VERSION_QWEN_IMAGE_2_1 || version == VERSION_MING_IMAGE || sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_minimax_h3(version) || sd_version_is_pixart(version)) {
             down_factor = 2;
         } else {
@@ -2893,7 +3107,9 @@ int StableDiffusionGGML::get_latent_channel() {
             latent_channel = 3;
         } else if (sd_version_is_sensenova_u1(version)) {
             latent_channel = 3;
-        } else if (sd_version_is_pid(version)) {
+        } else if (sd_version_is_z_image_l2p(version)) {
+            latent_channel = 3;
+        } else if (sd_version_is_pid(version) || version == VERSION_IRIS) {
             latent_channel = 3;
         } else if (sd_version_is_sefi_image(version)) {
             latent_channel = 144;
@@ -2994,7 +3210,7 @@ sd::Tensor<float> StableDiffusionGGML::encode_first_stage(const sd::Tensor<float
 }
 
 sd::Tensor<float> StableDiffusionGGML::decode_first_stage(const sd::Tensor<float>& x, bool decode_video) {
-    if (sd_version_is_pid(version) || sd_version_is_minit2i(version)) {
+    if (sd_version_is_pid(version) || sd_version_is_minit2i(version) || version == VERSION_IRIS) {
         return sd::ops::clamp((x + 1.f) * 0.5f, 0.0f, 1.0f);
     }
     auto latents                      = first_stage_model->diffusion_to_vae_latents(x);

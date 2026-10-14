@@ -250,13 +250,14 @@ namespace MiniMaxH3 {
 
     // Fallback rope on x in attention layout ([d, L, heads]) through the
     // generic Rope::apply_rope, which expects [d, heads, L].
-    static ggml_tensor* apply_partial_rope(ggml_context* ctx,
+    static ggml_tensor* apply_partial_rope(GGMLRunnerContext* runner_ctx,
                                            ggml_tensor* x,
                                            ggml_tensor* pe) {
+        auto ctx        = runner_ctx->ggml_ctx;
         int64_t rot_dim = pe->ne[2] * 2;
         GGML_ASSERT(rot_dim <= x->ne[0]);
         auto heads_major = ggml_permute(ctx, x, 0, 2, 1, 3);
-        auto rotated     = Rope::apply_rope(ctx,
+        auto rotated     = Rope::apply_rope(runner_ctx,
                                             ggml_ext_slice(ctx, heads_major, 0, 0, rot_dim),
                                             pe,
                                             false);
@@ -315,8 +316,8 @@ namespace MiniMaxH3 {
                     k = rk;
                 } else {
                     auto pe = rope_tables_to_pe(g, rope_cos, rope_sin);
-                    q       = apply_partial_rope(g, q, pe);
-                    k       = apply_partial_rope(g, k, pe);
+                    q       = apply_partial_rope(ctx, q, pe);
+                    k       = apply_partial_rope(ctx, k, pe);
                 }
             }
             auto out = ggml_ext_attention_ext(ctx,
