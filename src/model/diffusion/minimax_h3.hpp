@@ -13,6 +13,7 @@
 #include "core/ggml_tensor_utils.h"
 
 #include "core/ggml_graph_cut.h"
+#include "model/common/block.hpp"
 #include "model/diffusion/dit.hpp"
 #include "model/diffusion/model.hpp"
 
@@ -597,8 +598,8 @@ namespace MiniMaxH3 {
                 auto row   = modulation_row(ctx->ggml_ctx, mods, config.hidden_size, 2, 1, segment.modulation_row);
                 auto value = norm->forward(ctx, ggml_ext_slice(ctx->ggml_ctx, x, 1, segment.start, segment.end));
                 return ggml_add(ctx->ggml_ctx,
-                                    ggml_add(ctx->ggml_ctx, value, ggml_mul(ctx->ggml_ctx, value, row[1])),
-                                    row[0]);
+                                ggml_add(ctx->ggml_ctx, value, ggml_mul(ctx->ggml_ctx, value, row[1])),
+                                row[0]);
             };
             return {video_out->forward(ctx, apply(video)),
                     audio_out->forward(ctx, apply(audio))};
@@ -968,10 +969,10 @@ namespace MiniMaxH3 {
                 const auto& condition = condition_videos[index];
                 auto axes             = condition_spatial_axes(condition);
                 int64_t count         = condition.shape()[2] *
-                                static_cast<int64_t>(axes.first.size() * axes.second.size());
-                bool is_first    = keyframe_indices.empty() || keyframe_indices[static_cast<int64_t>(index)] == 0;
-                float keyframe_t = is_first ? static_cast<float>(text_len)
-                                            : static_cast<float>(text_len) + video_duration - FRAME_RESCALE;
+                                        static_cast<int64_t>(axes.first.size() * axes.second.size());
+                bool is_first         = keyframe_indices.empty() || keyframe_indices[static_cast<int64_t>(index)] == 0;
+                float keyframe_t      = is_first ? static_cast<float>(text_len)
+                                                 : static_cast<float>(text_len) + video_duration - FRAME_RESCALE;
                 for (int64_t t = 0; t < condition.shape()[2]; ++t) {
                     for (float h : axes.first) {
                         for (float w : axes.second) {
@@ -1025,9 +1026,9 @@ namespace MiniMaxH3 {
 
                 if (block.kind != MiniMaxH3ReferenceKind::AUDIO) {
                     GGML_ASSERT(ref_video != nullptr);
-                    auto axes     = condition_spatial_axes(*ref_video);
-                    int64_t count = ref_video->shape()[2] *
-                                    static_cast<int64_t>(axes.first.size() * axes.second.size());
+                    auto axes       = condition_spatial_axes(*ref_video);
+                    int64_t count   = ref_video->shape()[2] *
+                                      static_cast<int64_t>(axes.first.size() * axes.second.size());
                     float video_end = append_video_positions(*ref_video, cursor);
                     layout.sequence_segments.push_back({row,
                                                         row + count,

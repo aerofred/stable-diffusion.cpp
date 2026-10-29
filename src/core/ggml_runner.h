@@ -160,9 +160,8 @@ private:
     std::vector<ggml_tensor*> cross_step_prefetch_params_;
     size_t cross_step_prefetch_segment_ = SIZE_MAX;
 
-    sd::ComputeWorkspace::Measurement measure(ggml_cgraph* graph, size_t direct_bytes);
+    sd::ComputeWorkspace::Measurement measure(ggml_cgraph* graph);
     sd::ComputeWorkspace::Measurement measure_cached(ggml_cgraph* graph,
-                                                     size_t direct_bytes,
                                                      const std::vector<uint64_t>& layout,
                                                      size_t slot,
                                                      bool inputs_preallocated);
@@ -191,6 +190,7 @@ protected:
     sd::GraphCutTensorCache cut_cache_;
     sd::ComputeWorkspace workspace_;
     ggml_context* compute_ctx = nullptr;
+    std::unique_ptr<std::max_align_t[]> compute_ctx_buffer_;
     bool runner_started_      = false;
     bool graph_active_        = false;
 
@@ -200,7 +200,6 @@ protected:
     sd::LayerSplitPolicy graph_cut_layer_split_policy_;
 
     std::vector<ggml_backend_t> extra_runtime_backends;  // borrowed (SDBackendManager-owned)
-    bool multi_device_eval_callback_warned = false;
 
     std::shared_ptr<WeightAdapter> weight_adapter = nullptr;
     std::weak_ptr<DeviceResidencyManager> residency_manager;

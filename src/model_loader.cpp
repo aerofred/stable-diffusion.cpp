@@ -340,7 +340,7 @@ bool ModelLoader::init_from_safetensors_index_file(const std::string& file_path,
         const auto expected = (std::filesystem::u8path(file_path).parent_path() /
                                std::filesystem::u8path(entry.value().get<std::string>()))
                                   .lexically_normal();
-        bool found = false;
+        bool found          = false;
         for (const auto& shard : parsed_tensor_names_) {
             if (std::filesystem::u8path(shard.first).lexically_normal() == expected) {
                 found = shard.second.count(entry.key()) != 0;
@@ -439,6 +439,10 @@ bool ModelLoader::init_from_diffusers_file(const std::string& file_path, const s
 SDVersion ModelLoader::get_sd_version() const {
     TensorStorage token_embedding_weight, input_block_weight, context_ebedding_weight;
 
+    if (tensor_storage_map.count("model.diffusion_model.perceiver.latent_queries")) {
+        return VERSION_FIBO2;
+    }
+
     if (tensor_storage_map.find("model.diffusion_model.emb_in.image.weight") != tensor_storage_map.end() &&
         tensor_storage_map.find("model.diffusion_model.txt_mode_blocks.0.q_proj.weight") != tensor_storage_map.end()) {
         return VERSION_FLUX3;
@@ -464,6 +468,7 @@ SDVersion ModelLoader::get_sd_version() const {
     bool has_output_block_311        = false;
     bool has_output_block_71         = false;
     bool has_attn_1024               = false;
+    bool has_distilled_guidance      = false;
 
     for (auto& [name, tensor_storage] : tensor_storage_map) {
         if (tensor_storage.name.find("model.diffusion_model.double_blocks.") != std::string::npos ||
@@ -482,6 +487,9 @@ SDVersion ModelLoader::get_sd_version() const {
         }
         if (tensor_storage.name.find("model.diffusion_model.nerf_final_layer_conv.") != std::string::npos) {
             return VERSION_CHROMA_RADIANCE;
+        }
+        if (tensor_storage.name.find("distilled_guidance_layer.in_proj.weight") != std::string::npos) {
+            has_distilled_guidance = true;
         }
         if (tensor_storage.name.find("model.diffusion_model.joint_blocks.") != std::string::npos) {
             return VERSION_SD3;
@@ -672,6 +680,9 @@ SDVersion ModelLoader::get_sd_version() const {
     }
 
     if (is_flux && !is_flux2) {
+        if (has_distilled_guidance) {
+            return VERSION_CHROMA;
+        }
         if (context_ebedding_weight.ne[0] == 3584) {
             return VERSION_LONGCAT;
         } else {

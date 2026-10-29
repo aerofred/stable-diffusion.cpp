@@ -52,8 +52,13 @@ void GGMLRunner::free_params_ctx() {
 
 void GGMLRunner::alloc_compute_ctx() {
     ggml_init_params params;
-    params.mem_size   = static_cast<size_t>(ggml_tensor_overhead() * MAX_GRAPH_SIZE + ggml_graph_overhead());
-    params.mem_buffer = nullptr;
+    params.mem_size = static_cast<size_t>(ggml_tensor_overhead() * MAX_GRAPH_SIZE + ggml_graph_overhead());
+    if (compute_ctx_buffer_ == nullptr) {
+        const size_t count = (params.mem_size + sizeof(std::max_align_t) - 1) / sizeof(std::max_align_t);
+        compute_ctx_buffer_.reset(new std::max_align_t[count]);
+    }
+    // Keep tensor addresses stable between steps so CUDA graphs can finish warming up.
+    params.mem_buffer = compute_ctx_buffer_.get();
     params.no_alloc   = true;
 
     compute_ctx = ggml_init(params);
@@ -514,6 +519,8 @@ void GGMLRunner::runner_end() {
         return;
     }
     workspace_.release();
+    free_compute_ctx();
+    compute_ctx_buffer_.reset();
     cache_.clear();
     logged_compute_bytes_.clear();
     logged_segment_count_ = 0;
@@ -754,7 +761,7 @@ static size_t add_bytes(size_t a, size_t b) {
     return b > SIZE_MAX - a ? SIZE_MAX : a + b;
 }
 
-ComputeWorkspace::Measurement GGMLRunner::measure(ggml_cgraph* graph, size_t direct_bytes) {
+ComputeWorkspace::Measurement GGMLRunner::measure(ggml_cgraph* graph) {
     auto external_backend = [&](const ggml_tensor* tensor) -> ggml_backend_t {
         if (!params_tensor_set_.count(tensor)) {
             return nullptr;
@@ -765,16 +772,15 @@ ComputeWorkspace::Measurement GGMLRunner::measure(ggml_cgraph* graph, size_t dir
     auto assign_nodes = [&](ggml_backend_sched_t scheduler, ggml_cgraph* copy) {
         pin_multi_device_nodes(scheduler, copy, graph);
     };
-    return workspace_.measure(graph, direct_bytes, external_backend, assign_nodes);
+    return workspace_.measure(graph, external_backend, assign_nodes);
 }
 
 ComputeWorkspace::Measurement GGMLRunner::measure_cached(ggml_cgraph* graph,
-                                                         size_t direct_bytes,
                                                          const std::vector<uint64_t>& layout,
                                                          size_t slot,
                                                          bool inputs_preallocated) {
     if (layout.empty()) {
-        return measure(graph, direct_bytes);
+        return measure(graph);
     }
     if (layout != measurement_layout_) {
         invalidate_measurements();
@@ -794,7 +800,7 @@ ComputeWorkspace::Measurement GGMLRunner::measure_cached(ggml_cgraph* graph,
         entry = &segment_measurements_[slot];
     }
     if (!entry->has_value() || (*entry)->buffers.empty()) {
-        *entry = measure(graph, direct_bytes);
+        *entry = measure(graph);
     }
     return **entry;
 }
@@ -984,18 +990,9 @@ bool GGMLRunner::execute_segment(ggml_cgraph* graph, int n_threads) {
         sd_backend_cpu_set_n_threads(workspace_.cpu_backend(), n_threads);
     }
     auto scheduler = workspace_.scheduler();
-    ggml_status status;
-    if (scheduler != nullptr) {
-        if (sd_get_backend_eval_callback() != nullptr && !multi_device_eval_callback_warned) {
-            LOG_WARN("%s: eval callback is not supported with the backend scheduler; ignoring", get_desc().c_str());
-            multi_device_eval_callback_warned = true;
-        }
-        status = ggml_backend_sched_graph_compute(scheduler, graph);
-    } else {
-        status = sd_backend_graph_compute_with_eval_callback(runtime_backend, graph,
-                                                             sd_get_backend_eval_callback(),
-                                                             sd_get_backend_eval_callback_data());
-    }
+    GGML_ASSERT(scheduler != nullptr);
+    ggml_backend_sched_set_eval_callback(scheduler, sd_get_backend_eval_callback(), sd_get_backend_eval_callback_data());
+    const auto status = ggml_backend_sched_graph_compute(scheduler, graph);
     workspace_.synchronize();
     if (status != GGML_STATUS_SUCCESS) {
         last_compute_status_ = status;
@@ -1069,7 +1066,7 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
     if (!assign_graph_cut_layer_split_backends(graph, cached_plan, params)) {
         return std::nullopt;
     }
-    auto full_measurement = measure_cached(graph, cached_plan.compute_buffer_size, cached_plan.layout, SIZE_MAX, false);
+    auto full_measurement = measure_cached(graph, cached_plan.layout, SIZE_MAX, false);
     if (full_measurement.buffers.empty()) {
         last_compute_status_ = GGML_STATUS_ALLOC_FAILED;
         return std::nullopt;
@@ -1167,7 +1164,7 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
         const bool last     = index + 1 == plan.segments.size();
         auto fail_segment   = [&](const char* phase) {
             LOG_ERROR("%s segment %zu/%zu (%s) failed during %s", get_desc().c_str(),
-                        index + 1, plan.segments.size(), segment.group_name.c_str(), phase);
+                      index + 1, plan.segments.size(), segment.group_name.c_str(), phase);
             return std::nullopt;
         };
         cut_cache_.prune(segment.live_cut_names);
@@ -1196,7 +1193,7 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
         } segment_cleanup{*this, weights, bindings, segment_context};
 
         auto measurement = segmented
-                               ? measure_cached(segment_graph, segment.compute_buffer_size, cached_plan.layout, index, inputs_preallocated)
+                               ? measure_cached(segment_graph, cached_plan.layout, index, inputs_preallocated)
                                : full_measurement;
         lap(timing.measure);
         if (!workspace_.prepare(measurement)) {
@@ -1239,13 +1236,6 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
         // Preparing weights can execute LoRA graphs and reclaim an idle workspace;
         // only then does the capacity check need to run again.
         bool recheck = false;
-        if (!workspace_.measurement_matches(segment_graph, measurement)) {
-            measurement = measure(segment_graph, segment.compute_buffer_size);
-            if (segmented && index < segment_measurements_.size() && cached_plan.layout == measurement_layout_) {
-                segment_measurements_[index] = measurement;
-            }
-            recheck = true;
-        }
         for (size_t i = 0; i < measurement.buffers.size() && !recheck; ++i) {
             recheck = workspace_.bytes(measurement.buffers[i].backend) < reusable_before[i];
         }

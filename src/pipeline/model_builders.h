@@ -4,6 +4,7 @@
 #include <memory>
 #include <vector>
 
+#include "core/ggml_extend_backend.h"
 #include "model.h"
 #include "stable-diffusion.h"
 
@@ -58,6 +59,9 @@ namespace sd::model_builders {
         std::shared_ptr<VAE> preview;
         std::shared_ptr<AudioVAERunner> audio;
     };
+
+    bool ensure_backend_pair(SDBackendManager& backends, SDBackendModule module);
+    ggml_backend_t diffusion_backend(const Context& ctx);
 
     bool build_core_runners(const Context& ctx, CoreRunners& runners);
     bool build_vae_runners(const Context& ctx, const VAEOptions& options, VAERunners& runners);

@@ -1537,8 +1537,8 @@ bool ModelManager::assign_compute_backend(const std::vector<ggml_tensor*>& tenso
 
         const bool params_follow_compute = state->params_follow_compute_backend ||
                                            state->residency_mode == ResidencyMode::Disk;
-        const bool compute_changes = state->compute_backend != compute_backend;
-        const bool params_changes  = params_follow_compute && state->params_backend != compute_backend;
+        const bool compute_changes       = state->compute_backend != compute_backend;
+        const bool params_changes        = params_follow_compute && state->params_backend != compute_backend;
         if (!compute_changes && !params_changes) {
             continue;
         }
@@ -1639,7 +1639,7 @@ size_t ModelManager::compute_backend_resident_bytes(ggml_backend_t compute_backe
                                                      ? buffer_type != nullptr && ggml_backend_buft_get_device(buffer_type) == compute_device
                                                      : std::any_of(split_devices->second.begin(), split_devices->second.end(), [&](const auto& entry) {
                                          return ggml_backend_get_device(entry.first) == compute_device;
-                                     });
+                                                       });
         if (!on_device) {
             return;
         }
@@ -1931,10 +1931,10 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
         const size_t resident         = add(weights_resident, add(other_runtime, request.runtime_resident_bytes));
         if (log_details) {
             LOG_WARN("model manager memory on %s: reported free %.2f MB / total %.2f MB, tracked weights %.2f MB / other runtime %.2f MB / current runtime %.2f MB",
-                        ggml_backend_name(backend),
-                        free_bytes / (1024.0 * 1024.0), total_bytes / (1024.0 * 1024.0),
-                        weights_resident / (1024.0 * 1024.0), other_runtime / (1024.0 * 1024.0),
-                        request.runtime_resident_bytes / (1024.0 * 1024.0));
+                     ggml_backend_name(backend),
+                     free_bytes / (1024.0 * 1024.0), total_bytes / (1024.0 * 1024.0),
+                     weights_resident / (1024.0 * 1024.0), other_runtime / (1024.0 * 1024.0),
+                     request.runtime_resident_bytes / (1024.0 * 1024.0));
         }
         if (free_bytes == 0 && total_bytes == 0) {
             return SIZE_MAX;
@@ -1946,7 +1946,7 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
             }
             // A wrapped report may reflect real pressure; reclaim before accepting the tracked estimate.
             LOG_VERBOSE("ignoring impossible free memory report on %s (%.2f MB free / %.2f MB total), using tracked residency",
-                           ggml_backend_name(backend), free_bytes / (1024.0 * 1024.0), total_bytes / (1024.0 * 1024.0));
+                        ggml_backend_name(backend), free_bytes / (1024.0 * 1024.0), total_bytes / (1024.0 * 1024.0));
             free_bytes                  = total_bytes;
             result.requires_reclamation = true;
         }
@@ -2067,21 +2067,21 @@ bool ModelManager::ensure_compute_backend_capacity(
         }
         const bool reloadable = state->residency_mode == ResidencyMode::Disk ||
                                 state->compute_backend != state->params_backend;
-        const bool resident = state->compute_backend == state->params_backend
-                                  ? state->loaded_to_params_backend
-                                  : state->staged_to_compute_backend;
+        const bool resident   = state->compute_backend == state->params_backend
+                                    ? state->loaded_to_params_backend
+                                    : state->staged_to_compute_backend;
         if (reloadable && resident) {
             eviction_states.insert(state);
         }
     };
     size_t last_eviction_count   = 0;
     auto release_eviction_states = [&]() {
-        if (eviction_states.size() == last_eviction_count) {
-            return false;
+        if (eviction_states.size() != last_eviction_count) {
+            last_eviction_count = eviction_states.size();
+            release_compute_staging_blocks(false, &eviction_states);
+            release_params_storage_blocks(false, &eviction_states);
         }
-        last_eviction_count = eviction_states.size();
-        release_compute_staging_blocks(false, &eviction_states);
-        release_params_storage_blocks(false, &eviction_states);
+        // Device memory reports can lag behind releases even when no new candidates are added.
         return fits();
     };
 
