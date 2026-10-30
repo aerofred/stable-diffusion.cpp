@@ -80,6 +80,9 @@ namespace sd {
         // device that is the runner's own request.
         void enqueue_next(size_t segment_index,
                           const std::vector<DeviceMemoryRequest>& requests);
+        // Starts the transfer of a prepared prefetch once the current segment's
+        // compute has been issued, so the copies queue behind its input uploads.
+        void submit_next();
     };
 }
 

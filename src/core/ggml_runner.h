@@ -160,11 +160,17 @@ private:
     std::vector<ggml_tensor*> cross_step_prefetch_params_;
     size_t cross_step_prefetch_segment_ = SIZE_MAX;
 
-    sd::ComputeWorkspace::Measurement measure(ggml_cgraph* graph);
+    // External outputs are future cut outputs bound to the cut cache; they are
+    // measured as pre-allocated on the given backend (the runtime backend when null).
+    sd::ComputeWorkspace::Measurement measure(ggml_cgraph* graph,
+                                              const std::unordered_set<const ggml_tensor*>* external_outputs = nullptr,
+                                              ggml_backend_t external_outputs_backend                        = nullptr);
     sd::ComputeWorkspace::Measurement measure_cached(ggml_cgraph* graph,
                                                      const std::vector<uint64_t>& layout,
                                                      size_t slot,
-                                                     bool inputs_preallocated);
+                                                     bool inputs_preallocated,
+                                                     const std::unordered_set<const ggml_tensor*>* external_outputs = nullptr,
+                                                     ggml_backend_t external_outputs_backend                        = nullptr);
     void invalidate_measurements();
     void invalidate_layer_split_cache();
     size_t vram_limit_for(ggml_backend_t backend) const;
@@ -175,7 +181,10 @@ private:
                                                      const std::map<ggml_backend_t, size_t>& pending_cache_bytes) const;
     bool fits(const std::vector<DeviceMemoryRequest>& requests,
               const std::vector<ggml_tensor*>& params) const;
-    bool execute_segment(ggml_cgraph* graph, int n_threads);
+    bool execute_segment(ggml_cgraph* graph,
+                         int n_threads,
+                         ggml_backend_t compute_backend,
+                         const std::function<void()>& on_before_compute);
     std::optional<sd::Tensor<float>> execute_graph(ggml_cgraph* graph, int n_threads, bool no_return, const std::function<bool()>& read_outputs);
 
 protected:
@@ -191,8 +200,8 @@ protected:
     sd::ComputeWorkspace workspace_;
     ggml_context* compute_ctx = nullptr;
     std::unique_ptr<std::max_align_t[]> compute_ctx_buffer_;
-    bool runner_started_      = false;
-    bool graph_active_        = false;
+    bool runner_started_ = false;
+    bool graph_active_   = false;
 
     size_t max_graph_vram_bytes        = 0;
     bool graph_cut_layer_split_enabled = false;

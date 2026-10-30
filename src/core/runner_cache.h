@@ -18,10 +18,12 @@ namespace sd {
         ggml_backend_buffer_t buffer = nullptr;
         ggml_tensor* tensor          = nullptr;
         ~CachedTensor();
+        static std::unique_ptr<CachedTensor> allocate(ggml_backend_t backend, const std::string& name, ggml_tensor* source);
         static std::unique_ptr<CachedTensor> copy(ggml_backend_t backend,
                                                   const std::string& name,
                                                   ggml_tensor* source,
                                                   ggml_status& status);
+        bool matches(ggml_backend_t backend, const ggml_tensor* source) const;
         // Copies source into this entry when its tensor already has the same
         // layout on the target device, so a cut that recurs every graph does
         // not reallocate its cache buffer.
@@ -66,6 +68,12 @@ namespace sd {
         size_t estimate_output_bytes(ggml_cgraph* graph,
                                      const ggml_graph_cut::Segment& segment,
                                      ggml_backend_t backend = nullptr) const;
+        static bool can_bind_output(ggml_backend_t backend, const ggml_tensor* tensor);
+        // Binds a segment's future cut outputs to cache buffers before the
+        // workspace is allocated, so compute writes them in place and capture
+        // has nothing to copy. An entry with the same layout is reused.
+        bool bind_outputs(const std::unordered_set<const ggml_tensor*>& outputs,
+                          ggml_backend_t backend = nullptr);
         ggml_status capture(ggml_cgraph* graph,
                             const ggml_graph_cut::Segment& segment,
                             const char* log_desc,
